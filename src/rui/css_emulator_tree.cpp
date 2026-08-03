@@ -779,6 +779,8 @@ void UpdateUIFrame(
 ) {
     if(width < 0.0f) width = static_cast<float>(GetScreenWidth());
     if(height < 0.0f) height = static_cast<float>(GetScreenHeight());
+    root.rect.transform.width=width;
+    root.rect.transform.height=height;
     LayoutContainer(root,style_sheet,width,height,force_layout);
     UpdateElements(root,true,false);
 }

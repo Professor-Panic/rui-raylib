@@ -1,0 +1,7 @@
+<UI id="editor">
+    <Container id="header">
+    <Button class= "header-item" id="one">File</Button>
+    <Button class= "header-item" id="two">Edit</Button>
+    <Label class= "header-item">Text</Label>
+    </Container>
+</UI>
