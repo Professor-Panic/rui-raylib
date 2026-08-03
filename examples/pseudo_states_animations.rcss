@@ -1,0 +1,53 @@
+:root {
+    --surface: #21172C;
+    --surface-hover: #322040;
+    --accent: #B88CFF;
+    --muted-border: #59436A;
+}
+
+.inventory-slot {
+    background-color: var(--surface);
+    border-color: var(--muted-border);
+    border-width: 1px;
+    border-radius: 0.18;
+    opacity: 0.82;
+    padding: 10px;
+    transition:
+        background-color 160ms ease-out,
+        border-color 160ms ease-out,
+        opacity 220ms linear,
+        padding 180ms ease-out;
+}
+
+.inventory-slot:hover {
+    background-color: var(--surface-hover);
+}
+
+.inventory-slot:selected {
+    border-color: var(--accent);
+    opacity: 1;
+    padding: 12px;
+}
+
+.inventory-slot:selected:hover {
+    background-color: #44295A;
+}
+
+.inventory-slot:invalid {
+    animation: invalid-pulse 420ms ease-in-out 2 alternate both;
+}
+
+@keyframes invalid-pulse {
+    from {
+        border-color: #7A4A59;
+        opacity: 0.7;
+    }
+    50% {
+        border-color: #FF5577;
+        opacity: 1;
+    }
+    to {
+        border-color: #7A4A59;
+        opacity: 0.85;
+    }
+}

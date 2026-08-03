@@ -1,0 +1,31 @@
+<UI id="pseudo-animation-demo">
+  <Functions>
+    <Function name="toggleSelected">
+      <ToggleState name="selected" />
+    </Function>
+
+    <Function name="showInvalid">
+      <SetState name="invalid" value="true" />
+      <RestartAnimation name="invalid-pulse" />
+    </Function>
+
+    <Function name="clearInvalid">
+      <RemoveState target="slot" name="invalid" />
+      <StopAnimation target="slot" name="invalid-pulse" />
+    </Function>
+  </Functions>
+
+  <Column id="demo-panel">
+    <Button id="slot"
+            class="inventory-slot"
+            state:equipped="{itemEquipped}"
+            onClick="toggleSelected">
+      Inventory slot
+    </Button>
+
+    <Row>
+      <Button onClick="showInvalid">Play invalid animation</Button>
+      <Button onClick="clearInvalid">Clear</Button>
+    </Row>
+  </Column>
+</UI>
