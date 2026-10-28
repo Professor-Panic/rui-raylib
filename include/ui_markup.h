@@ -1,13 +1,16 @@
 #pragma once
 
 #include "css_emulator.h"
+#include "component_registry.h"
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <typeinfo>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -16,6 +19,29 @@
 
 struct UIXObject;
 struct UIXArray;
+class UIXValue;
+
+// Customization point for types UIXValue does not know. Specialize it (before
+// the type is first bound) to make Field()/Ref()/Bind() work with it directly:
+//
+//   template <> struct UIXConvert<entt::entity> {
+//       static UIXValue ToValue(const entt::entity& e);
+//       static bool FromValue(const UIXValue& v, entt::entity& out);
+//   };
+//
+// The primary template is empty on purpose; an enable_if'd second parameter
+// lets one specialization cover a family of types.
+template <typename T, typename Enable = void>
+struct UIXConvert {};
+
+template <typename T, typename Enable = void>
+struct UIXHasConvert : std::false_type {};
+
+template <typename T>
+struct UIXHasConvert<T,std::void_t<
+    decltype(UIXConvert<T>::ToValue(std::declval<const T&>())),
+    decltype(UIXConvert<T>::FromValue(std::declval<const UIXValue&>(),std::declval<T&>()))
+>> : std::true_type {};
 
 class UIXValue {
 public:
@@ -76,18 +102,41 @@ public:
         if constexpr(std::is_same_v<Value,UIXValue>) {
             return value;
         }
+        else if constexpr(UIXHasConvert<Value>::value) {
+            return UIXConvert<Value>::ToValue(value);
+        }
         else if constexpr(std::is_enum_v<Value>) {
-            return UIXValue(static_cast<int>(value));
+            return FromInteger(static_cast<std::underlying_type_t<Value>>(value));
         }
         else if constexpr(std::is_floating_point_v<Value>) {
             return UIXValue(static_cast<double>(value));
         }
         else if constexpr(std::is_integral_v<Value> && !std::is_same_v<Value,bool>) {
-            return UIXValue(static_cast<int>(value));
+            return FromInteger(value);
         }
         else {
             return UIXValue(value);
         }
+    }
+
+    // Values that fit an int stay ints; wider ones (uint32_t ids, entt handles
+    // with a version in the high bits) are stored as double, which is exact up
+    // to 2^53, instead of wrapping negative.
+    template <typename TInteger>
+    static UIXValue FromInteger(TInteger value) {
+        if constexpr(std::is_signed_v<TInteger>) {
+            const long long wide = static_cast<long long>(value);
+            if(wide >= std::numeric_limits<int>::min() && wide <= std::numeric_limits<int>::max()) {
+                return UIXValue(static_cast<int>(wide));
+            }
+        }
+        else {
+            if(static_cast<unsigned long long>(value) <=
+               static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+                return UIXValue(static_cast<int>(value));
+            }
+        }
+        return UIXValue(static_cast<double>(value));
     }
 
     template <typename T>
@@ -96,6 +145,9 @@ public:
         if constexpr(std::is_same_v<Value,UIXValue>) {
             destination = *this;
             return true;
+        }
+        else if constexpr(UIXHasConvert<Value>::value) {
+            return UIXConvert<Value>::FromValue(*this,destination);
         }
         else if constexpr(std::is_same_v<Value,std::string>) {
             destination = String();
@@ -106,7 +158,9 @@ public:
             return true;
         }
         else if constexpr(std::is_enum_v<Value>) {
-            destination = static_cast<Value>(static_cast<int>(Number()));
+            destination = static_cast<Value>(
+                static_cast<std::underlying_type_t<Value>>(Number())
+            );
             return true;
         }
         else if constexpr(std::is_integral_v<Value>) {
@@ -254,6 +308,18 @@ public:
     bool Writable() const;
     bool Expired() const;
 
+    // Optional hook for bindings that cache their source (BindList with a
+    // source function). Registry::Invalidate(name) calls it.
+    // Returns true if it actually invalidated something.
+    using Invalidator = std::function<bool()>;
+    UIXBinding& OnInvalidate(Invalidator invalidator) {
+        invalidator_ = std::move(invalidator);
+        return *this;
+    }
+    bool Invalidate() const {
+        return invalidator_ && invalidator_();
+    }
+
     static UIXBinding Constant(UIXValue value);
     static UIXBinding TrackedConstant(
         UIXValue value,
@@ -290,15 +356,45 @@ private:
     Getter getter_;
     Setter setter_;
     AlivePredicate alive_;
+    Invalidator invalidator_;
 };
 
 struct UIXObject {
     std::unordered_map<std::string,UIXBinding> fields;
+
+    // Set by BindList: the C++ row this object was built from. Non-owning;
+    // valid until the bound vector is modified (same rule as field bindings).
+    void* native = nullptr;
+    const std::type_info* native_type = nullptr;
 };
 
 struct UIXArray {
     std::vector<UIXBinding> items;
 };
+
+// Builds a binding from `T& accessor(Object&)`. Used by Ref().
+template <typename TObject, typename TAccessor>
+UIXBinding UIXRefBinding(TObject* object, TAccessor accessor) {
+    using Result = std::invoke_result_t<TAccessor&,TObject&>;
+    static_assert(
+        std::is_lvalue_reference_v<Result>,
+        "Ref accessor must return an lvalue reference (T&), e.g. [&](Row& r) -> T& { ... }"
+    );
+    auto getter = [object,accessor]() mutable {
+        return UIXValue::From(accessor(*object));
+    };
+    if constexpr(std::is_const_v<std::remove_reference_t<Result>>) {
+        return UIXBinding(std::move(getter));
+    }
+    else {
+        return UIXBinding(
+            std::move(getter),
+            [object,accessor](const UIXValue& incoming) mutable {
+                return incoming.AssignTo(accessor(*object));
+            }
+        );
+    }
+}
 
 template <typename TObject>
 class UIXObjectBuilder {
@@ -358,6 +454,15 @@ public:
         return *this;
     }
 
+    // One accessor instead of a getter/setter pair:
+    //   b.Ref("name", [&](Row& r) -> std::string& { return reg.get<C>(r.id).name; });
+    // A const reference result makes the field read-only.
+    template <typename TAccessor>
+    UIXObjectBuilder& Ref(std::string name, TAccessor accessor) {
+        output_->fields[std::move(name)] = UIXRefBinding(object_,std::move(accessor));
+        return *this;
+    }
+
     template <typename TField, typename TConfigure>
     UIXObjectBuilder& Object(
         std::string name,
@@ -396,6 +501,77 @@ struct UIXListBuilderState {
     using Configure = std::function<void(UIXObject&,TObject&)>;
     std::vector<TObject>* values = nullptr;
     std::vector<Configure> configure;
+
+    // Source-driven lists (BindList(name, source_fn)): `owned` is refilled from
+    // `source` the next time the list is read after Invalidate().
+    std::function<std::vector<TObject>()> source;
+    std::vector<TObject> owned;
+    bool dirty = true;
+};
+
+// Returned by UIXListBuilder::Via(). Each row is mapped to another object
+// (e.g. the component an entity row points at), so fields can be declared
+// with plain member pointers instead of accessor lambdas:
+//
+//   runtime.BindList("Items", source)
+//       .Via([&](Row& r) -> Item& { return reg.get<Item>(r.id); })
+//       .Ref("name", &Item::name);
+//
+// TBuilder is the UIXListBuilder<TRow> it forwards to. Copies are cheap (the
+// builder shares its state), and the projection is copied into each binding,
+// so capture by reference only what outlives the UI.
+template <typename TBuilder, typename TRow, typename TProject>
+class UIXProjectedListBuilder {
+public:
+    using Target = std::remove_cv_t<
+        std::remove_reference_t<std::invoke_result_t<TProject&,TRow&>>
+    >;
+
+    UIXProjectedListBuilder(TBuilder builder, TProject project)
+        : builder_(std::move(builder)), project_(std::move(project)) {}
+
+    // Reference field by member pointer: Ref("name", &Item::name).
+    // A const member makes the field read-only.
+    template <typename TField>
+    UIXProjectedListBuilder& Ref(std::string name, TField Target::* member) {
+        builder_.Ref(
+            std::move(name),
+            [project=project_,member](TRow& row) mutable -> TField& {
+                return project(row).*member;
+            }
+        );
+        return *this;
+    }
+
+    // Same, for an accessor on the projected object:
+    //   Ref("hp", [](Item& i) -> int& { return i.stats.hp; })
+    template <typename TAccessor>
+    UIXProjectedListBuilder& Ref(std::string name, TAccessor accessor) {
+        builder_.Ref(
+            std::move(name),
+            [project=project_,accessor](TRow& row) mutable -> decltype(auto) {
+                return accessor(project(row));
+            }
+        );
+        return *this;
+    }
+
+    // Field() is an alias so it reads the same as the non-projected builder.
+    template <typename TField>
+    UIXProjectedListBuilder& Field(std::string name, TField Target::* member) {
+        return Ref(std::move(name),member);
+    }
+
+    // Back to the row-level builder (to add Field("id",&Row::id) etc.).
+    TBuilder& Base() { return builder_; }
+
+    UIXBindingHandle Handle() const { return builder_.Handle(); }
+    UIXBindingHandle Done() const { return builder_.Done(); }
+    UIXScopedBinding Scoped() const { return builder_.Scoped(); }
+
+private:
+    TBuilder builder_;
+    TProject project_;
 };
 
 template <typename TObject>
@@ -448,6 +624,19 @@ public:
         return *this;
     }
 
+    // One accessor instead of a getter/setter pair:
+    //   list.Ref("name", [&](Row& r) -> std::string& { return reg.get<C>(r.id).name; });
+    // A const reference result makes the field read-only.
+    template <typename TAccessor>
+    UIXListBuilder& Ref(std::string name, TAccessor accessor) {
+        state_->configure.push_back(
+            [name=std::move(name),accessor](UIXObject& output,TObject& object) {
+                output.fields[name] = UIXRefBinding(&object,accessor);
+            }
+        );
+        return *this;
+    }
+
     template <typename TField, typename TConfigure>
     UIXListBuilder& Object(
         std::string name,
@@ -475,6 +664,27 @@ public:
         return *this;
     }
 
+    // Maps each row to another object so Ref()/Field() can take member
+    // pointers of it. `project` must return an lvalue reference.
+    template <typename TProject>
+    auto Via(TProject project) {
+        static_assert(
+            std::is_lvalue_reference_v<std::invoke_result_t<TProject&,TObject&>>,
+            "Via projection must return an lvalue reference, e.g. [&](Row& r) -> C& { ... }"
+        );
+        return UIXProjectedListBuilder<UIXListBuilder,TObject,TProject>(
+            *this,std::move(project)
+        );
+    }
+
+    // Used by BindList(name, source_fn).
+    template <typename TSource>
+    UIXListBuilder& SetSource(TSource source) {
+        state_->source = std::move(source);
+        state_->dirty = true;
+        return *this;
+    }
+
     UIXBindingHandle Handle() const { return handle_; }
     UIXBindingHandle Done() const { return handle_; }
     UIXScopedBinding Scoped() const {
@@ -494,6 +704,21 @@ struct UIXEvent {
     int index = -1;
     Rectangle bounds{};
     void* native_widget = nullptr;
+
+    // When the handler runs inside a <for>, this is the row object of the
+    // innermost loop and `index` is its loop index (unless the widget already
+    // supplied one).
+    std::shared_ptr<UIXObject> item;
+
+    // The C++ row behind the enclosing <for> iteration, or nullptr if the
+    // event is not inside a loop over a BindList of TItem.
+    template <typename TItem>
+    TItem* Item() const {
+        if(!item || item->native == nullptr || item->native_type == nullptr) return nullptr;
+        return *item->native_type == typeid(TItem)
+            ? static_cast<TItem*>(item->native)
+            : nullptr;
+    }
 };
 
 using UIXArguments = std::vector<UIXValue>;
@@ -589,11 +814,26 @@ public:
         std::string name,
         std::vector<TObject>& values
     ) {
+        return BindListImpl<TObject>(std::move(name),&values);
+    }
+
+    // Shared by the vector and source overloads. `values` may be null for a
+    // source-driven list; the source fills it on first read.
+    template <typename TObject>
+    UIXListBuilder<TObject> BindListImpl(
+        std::string name,
+        std::vector<TObject>* values
+    ) {
         auto state = std::make_shared<UIXListBuilderState<TObject>>();
-        state->values = &values;
+        state->values = values;
 
         UIXBinding binding(
             [state]() {
+                if(state->source && state->dirty) {
+                    state->owned = state->source();
+                    state->values = &state->owned;
+                    state->dirty = false;
+                }
                 auto array = std::make_shared<UIXArray>();
                 if(state->values == nullptr) return UIXValue(std::move(array));
                 array->items.reserve(state->values->size());
@@ -609,6 +849,8 @@ public:
                         }
                         else {
                             auto fields = std::make_shared<UIXObject>();
+                            fields->native = &value;
+                            fields->native_type = &typeid(TObject);
                             array->items.push_back(
                                 UIXBinding::Constant(UIXValue(std::move(fields)))
                             );
@@ -617,6 +859,8 @@ public:
                     }
 
                     auto fields = std::make_shared<UIXObject>();
+                    fields->native = &value;
+                    fields->native_type = &typeid(TObject);
                     for(const auto& configure : state->configure) {
                         configure(*fields,value);
                     }
@@ -628,12 +872,52 @@ public:
             }
         );
 
+        binding.OnInvalidate([state]() {
+            if(!state->source) return false;   // vector-backed lists are always live
+            state->dirty = true;
+            return true;
+        });
         const UIXBindingHandle handle = Bind(
             std::move(name),
             std::move(binding)
         );
         return UIXListBuilder<TObject>(std::move(state),handle);
     }
+
+    // Source-driven list: rows come from a function instead of a vector you
+    // keep in sync. The function runs on first read and again on the first
+    // read after Invalidate(name):
+    //
+    //   runtime.BindList("GameComponents", [&]{ return BuildRows(); });
+    //   ...
+    //   registry.on_construct<GameComponent>().connect<&Invalidate>();  // -> runtime.Invalidate("GameComponents")
+    //
+    // Rows are owned by the list and stay put until the next Invalidate().
+    template <
+        typename TSource,
+        typename = std::enable_if_t<std::is_invocable_v<TSource&>>
+    >
+    auto BindList(std::string name, TSource source) {
+        using TObject = typename std::invoke_result_t<TSource&>::value_type;
+        auto builder = BindListImpl<TObject>(std::move(name),nullptr);
+        builder.SetSource(std::move(source));
+        return builder;
+    }
+
+    template <
+        typename TSource, typename TConfigure,
+        typename = std::enable_if_t<std::is_invocable_v<TSource&>>
+    >
+    auto BindList(std::string name, TSource source, TConfigure configure) {
+        auto builder = BindList(std::move(name),std::move(source));
+        configure(builder);
+        return builder;
+    }
+
+    // Marks a cached BindList source as stale. Returns false if `name` is not
+    // a source-driven list. Nothing is rebuilt until the UI is rebuilt; use
+    // UIXRuntime::Invalidate to also request that.
+    bool Invalidate(const std::string& name);
 
     template <typename TObject, typename TConfigure>
     UIXListBuilder<TObject> BindList(
@@ -658,6 +942,37 @@ public:
         std::string name,
         std::function<void(const UIXEvent&)> function
     );
+
+    // Registers a function that receives the C++ row of the enclosing <for>
+    // (a BindList<TItem> element) instead of making you look it up:
+    //   ItemFunction<Row>("select", [](Row& row) { ... });
+    //   ItemFunction<Row>("select", [](Row& row, const UIXEvent& e) { ... });
+    //   ItemFunction<Row>("select", [](Row& row, const UIXArguments& a, UIXEvent& e) { ... });
+    // If the call is not inside a loop over TItem, the callback is skipped.
+    template <typename TItem, typename TFunction>
+    UIXBindingHandle ItemFunction(std::string name, TFunction function) {
+        return Function(
+            std::move(name),
+            UIXNativeFunction(
+                [function=std::move(function)](
+                    const UIXArguments& arguments,UIXEvent& event
+                ) mutable -> UIXValue {
+                    TItem* item = event.Item<TItem>();
+                    if(item == nullptr) return UIXValue{};
+                    if constexpr(std::is_invocable_v<TFunction&,TItem&,const UIXArguments&,UIXEvent&>) {
+                        function(*item,arguments,event);
+                    }
+                    else if constexpr(std::is_invocable_v<TFunction&,TItem&,const UIXEvent&>) {
+                        function(*item,static_cast<const UIXEvent&>(event));
+                    }
+                    else {
+                        function(*item);
+                    }
+                    return UIXValue{};
+                }
+            )
+        );
+    }
 
     bool Unbind(const std::string& name);
     bool Unbind(const UIXBindingHandle& handle);
@@ -799,12 +1114,43 @@ public:
         return builder;
     }
 
+    template <
+        typename TSource,
+        typename = std::enable_if_t<std::is_invocable_v<TSource&>>
+    >
+    auto BindList(std::string name, TSource source) {
+        auto builder = Registry().BindList(std::move(name),std::move(source));
+        Add(builder.Handle());
+        return builder;
+    }
+
+    template <
+        typename TSource, typename TConfigure,
+        typename = std::enable_if_t<std::is_invocable_v<TSource&>>
+    >
+    auto BindList(std::string name, TSource source, TConfigure configure) {
+        auto builder = BindList(std::move(name),std::move(source));
+        configure(builder);
+        return builder;
+    }
+
     template <typename TFunction>
     UIXBindingHandle Function(
         std::string name,
         TFunction&& function
     ) {
         return Add(Registry().Function(
+            std::move(name),
+            std::forward<TFunction>(function)
+        ));
+    }
+
+    template <typename TItem, typename TFunction>
+    UIXBindingHandle ItemFunction(
+        std::string name,
+        TFunction&& function
+    ) {
+        return Add(Registry().template ItemFunction<TItem>(
             std::move(name),
             std::forward<TFunction>(function)
         ));
@@ -842,6 +1188,9 @@ inline UIXBindingGroup UIXRegistry::BindGroup() {
 enum class UIXNodeType {
     Element,
     Text
+};
+struct UIXPreset {
+    std::unordered_map<std::string, std::string> values;
 };
 
 struct UIXSourceLocation {
@@ -887,6 +1236,7 @@ struct UIXDocument {
     std::unordered_map<std::string,UIXFunction> functions;
     std::unordered_map<std::string,UIXComponent> components;
     std::vector<UIXDiagnostic> diagnostics;
+    std::unordered_map<std::string, UIXPreset> presets;
 
     bool Valid() const;
 };
@@ -993,6 +1343,17 @@ public:
     UIXRegistry& Registry();
     const UIXRegistry& Registry() const;
 
+    // RUI 0.9 component metadata/registration registry. The default registry
+    // contains the built-in components but stays mutable until the first
+    // rebuild so applications can register custom components explicitly.
+    UIComponentRegistry& Components();
+    const UIComponentRegistry& Components() const;
+    void SetComponentRegistry(std::shared_ptr<UIComponentRegistry> registry);
+    bool FreezeComponents(std::vector<std::string>* diagnostics = nullptr);
+    std::string ComponentSchemaJson() const;
+    std::string ProjectSchemaJson() const;
+    std::string ComponentReferenceMarkdown() const;
+
     // Common registry operations are forwarded so most users never need Registry().
     UIXBindingHandle Bind(std::string name, UIXBinding binding) {
         return Registry().Bind(std::move(name),std::move(binding));
@@ -1070,12 +1431,50 @@ public:
         );
     }
 
+    template <
+        typename TSource,
+        typename = std::enable_if_t<std::is_invocable_v<TSource&>>
+    >
+    auto BindList(std::string name, TSource source) {
+        return Registry().BindList(std::move(name),std::move(source));
+    }
+
+    template <
+        typename TSource, typename TConfigure,
+        typename = std::enable_if_t<std::is_invocable_v<TSource&>>
+    >
+    auto BindList(std::string name, TSource source, TConfigure configure) {
+        return Registry().BindList(
+            std::move(name),std::move(source),std::move(configure)
+        );
+    }
+
+    // Marks a source-driven list (BindList(name, fn)) stale and requests a
+    // rebuild, so the next rui::Context::Update re-reads it. Safe to call from
+    // entt signals / destructors: nothing is rebuilt inside the call.
+    bool Invalidate(const std::string& name) {
+        const bool found = Registry().Invalidate(name);
+        if(found) RequestRebuild();
+        return found;
+    }
+
     template <typename TFunction>
     UIXBindingHandle Function(
         std::string name,
         TFunction&& function
     ) {
         return Registry().Function(
+            std::move(name),
+            std::forward<TFunction>(function)
+        );
+    }
+
+    template <typename TItem, typename TFunction>
+    UIXBindingHandle ItemFunction(
+        std::string name,
+        TFunction&& function
+    ) {
+        return Registry().template ItemFunction<TItem>(
             std::move(name),
             std::forward<TFunction>(function)
         );
@@ -1119,6 +1518,9 @@ public:
     void SetDocument(UIXDocument document);
 
     const UIXDocument& Document() const;
+    // Combined contents of inline <Style> blocks and linked <Style src="..."/>
+    // files in the currently loaded document.
+    const std::string& EmbeddedStyleSource() const;
     const std::vector<UIXDiagnostic>& Diagnostics() const;
     void ClearRuntimeDiagnostics();
 
@@ -1126,6 +1528,13 @@ public:
         UIContainer& destination,
         const UIXBuildOptions& options = {}
     );
+
+    // Set when scope-local `state="..."` changed value (or RequestRebuild()
+    // was called). Markup `if`/`for` are evaluated at build time, so the host
+    // must call Rebuild() afterwards; rui::Context::Update does this itself.
+    // Rebuild() clears the flag.
+    bool RebuildRequested() const;
+    void RequestRebuild();
 
     // Synchronizes two-way state without rebuilding the tree.
     void Update(UIContainer& destination);
@@ -1161,4 +1570,3 @@ public:
 private:
     std::unique_ptr<Impl> impl_;
 };
-

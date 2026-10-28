@@ -34,7 +34,7 @@ void PreserveUIElementBase(
     destination.animation_state = source.animation_state;
     destination.layout_animation_state = source.layout_animation_state;
     destination.last_layout_pseudo_hash = source.last_layout_pseudo_hash;
-    for(const std::string& state : source.pseudo_states.ActiveNames()) {
+    for(const std::string& state : source.pseudo_states.ActiveNamesView()) {
         destination.pseudo_states.Set(state,true);
     }
 }
@@ -131,6 +131,16 @@ void PreserveUIElementState(
                 next.component_buffers = previous.component_buffers;
                 next.active_component = previous.active_component;
                 next.caret_frame_counter = previous.caret_frame_counter;
+                next.drag_text_editing = previous.drag_text_editing;
+                next.drag_text_select_all = previous.drag_text_select_all;
+                next.text_caret = previous.text_caret;
+                next.text_anchor = previous.text_anchor;
+                next.text_selection_start = previous.text_selection_start;
+                next.text_selection_end = previous.text_selection_end;
+                next.text_mouse_selecting = previous.text_mouse_selecting;
+                next.last_drag_click_time = previous.last_drag_click_time;
+                next.last_drag_click_position = previous.last_drag_click_position;
+                next.last_drag_click_component = previous.last_drag_click_component;
                 next.picker_open = previous.picker_open;
                 next.picker_initialized = previous.picker_initialized;
                 next.picker_hue = previous.picker_hue;
@@ -245,6 +255,20 @@ UIElement* FindUIElement(UIContainer& container, const std::string& key) {
                     for(UIDockPanel& panel : dock->panels) {
                         if(UIElement* found = FindUIElement(panel.content,key)) return found;
                     }
+                }
+                else if(auto* viewport = dynamic_cast<UIViewport*>(widget.get())) {
+                    return FindUIElement(viewport->content,key);
+                }
+                else if(auto* item = dynamic_cast<UIViewportItem*>(widget.get())) {
+                    return FindUIElement(item->content,key);
+                }
+                else if(auto* list = dynamic_cast<UIVirtualList*>(widget.get())) {
+                    return list->UsesTemplate()
+                        ? FindUIElement(list->content,key)
+                        : nullptr;
+                }
+                if(UIContainer* custom_children = widget->ChildContainer()) {
+                    return FindUIElement(*custom_children,key);
                 }
                 return nullptr;
             }

@@ -1,4 +1,5 @@
 #include "css_emulator.h"
+#include "css_parser.h"
 #include "tweeny-4.0.0.h"
 
 #include <map>
@@ -59,6 +60,10 @@ std::optional<PropertyValueType> StylePropertyValue(
         case PropertyType::TextColor: return style.text_color;
         case PropertyType::ImageTint: return style.image_tint;
         case PropertyType::BorderWidth: return style.border_width;
+        case PropertyType::BorderTopWidth: return style.border_widths.top;
+        case PropertyType::BorderRightWidth: return style.border_widths.right;
+        case PropertyType::BorderBottomWidth: return style.border_widths.bottom;
+        case PropertyType::BorderLeftWidth: return style.border_widths.left;
         case PropertyType::BorderRadius: return style.border_radius;
         case PropertyType::Width: return style.width;
         case PropertyType::Height: return style.height;
@@ -146,6 +151,8 @@ bool PropertyValuesEqual(const PropertyValueType& a, const PropertyValueType& b)
     UI_COMPARE_ENUM(GridAutoFlow);
     UI_COMPARE_ENUM(UIImageFit);
     UI_COMPARE_ENUM(UIImageSampling);
+    UI_COMPARE_ENUM(UIImageSliceMode);
+    UI_COMPARE_ENUM(UIImageBlendMode);
 #undef UI_COMPARE_ENUM
     return false;
 }
@@ -218,6 +225,70 @@ bool IsAnimatableProperty(PropertyType property) {
     return std::find(properties.begin(),properties.end(),property)!=properties.end();
 }
 
+std::size_t HashVisualAnimationTarget(const ComputedStyle& style) {
+    std::size_t seed = HashColor(style.background_color);
+    HashCombine(seed,HashColor(style.border_color));
+    HashCombine(seed,HashColor(style.text_color));
+    HashCombine(seed,HashColor(style.image_tint));
+    HashCombine(seed,HashFloat(style.border_radius));
+    HashCombine(seed,HashFloat(style.opacity));
+    if(style.custom_properties) {
+        std::size_t custom_hash=0;
+        for(const auto& entry:*style.custom_properties) {
+            std::size_t item=std::hash<std::string>{}(entry.first);
+            HashCombine(item,std::hash<std::string>{}(entry.second));
+            custom_hash ^= item + 0x9e3779b9 + (item<<6) + (item>>2);
+        }
+        HashCombine(seed,custom_hash);
+    }
+    if(style.component_style_properties) {
+        std::size_t component_hash=0;
+        for(const auto& entry:*style.component_style_properties) {
+            std::size_t item=std::hash<std::string>{}(entry.first);
+            HashCombine(item,std::hash<std::string>{}(entry.second));
+            component_hash ^= item + 0x9e3779b9 + (item<<6) + (item>>2);
+        }
+        HashCombine(seed,component_hash);
+    }
+    if(style.shader_uniforms) {
+        for(const auto& binding:*style.shader_uniforms) {
+            HashCombine(seed,std::hash<std::string>{}(binding.name));
+            HashCombine(seed,std::hash<std::string>{}(binding.raw_value));
+        }
+    }
+
+    HashCombine(seed,style.transitions.size());
+    for(const UITransitionSpec& transition : style.transitions) {
+        HashCombine(seed,std::hash<bool>{}(transition.all));
+        HashCombine(seed,HashFloat(transition.duration));
+        HashCombine(seed,HashFloat(transition.delay));
+        HashCombine(seed,static_cast<std::size_t>(transition.easing));
+        HashCombine(seed,transition.properties.size());
+        for(PropertyType property : transition.properties) {
+            HashCombine(seed,static_cast<std::size_t>(property));
+        }
+        HashCombine(seed,transition.dynamic_properties.size());
+        for(const std::string& property : transition.dynamic_properties) {
+            HashCombine(seed,std::hash<std::string>{}(property));
+        }
+    }
+
+    HashCombine(seed,style.animations.size());
+    for(const UIAnimationSpec& animation : style.animations) {
+        HashCombine(seed,std::hash<std::string>{}(animation.name));
+        HashCombine(seed,HashFloat(animation.duration));
+        HashCombine(seed,HashFloat(animation.delay));
+        HashCombine(seed,static_cast<std::size_t>(animation.easing));
+        HashCombine(seed,HashFloat(animation.iterations));
+        HashCombine(seed,std::hash<bool>{}(animation.infinite));
+        HashCombine(seed,static_cast<std::size_t>(animation.direction));
+        HashCombine(seed,static_cast<std::size_t>(animation.fill_mode));
+        HashCombine(seed,std::hash<bool>{}(animation.paused));
+    }
+
+    return seed;
+}
+
 const UITransitionSpec* TransitionForProperty(
     const ComputedStyle& style,
     PropertyType property
@@ -231,6 +302,234 @@ const UITransitionSpec* TransitionForProperty(
         }
     }
     return all_match;
+}
+
+
+struct DynamicScalar {
+    float value=0.0f;
+    std::string suffix;
+};
+
+using DynamicAnimationValue = std::variant<
+    DynamicScalar,
+    Color,
+    std::vector<float>,
+    std::string
+>;
+
+std::optional<DynamicScalar> ParseDynamicScalar(std::string raw) {
+    raw=TrimCSS(raw);
+    if(raw.empty()) return std::nullopt;
+    std::size_t parsed=0;
+    float value=0.0f;
+    try { value=std::stof(raw,&parsed); }
+    catch(...) { return std::nullopt; }
+    if(parsed==0) return std::nullopt;
+    DynamicScalar result;
+    result.value=value;
+    result.suffix=TrimCSS(raw.substr(parsed));
+    return result;
+}
+
+DynamicAnimationValue ParseDynamicAnimationValue(std::string raw) {
+    raw=TrimCSS(raw);
+    if(auto color=ParseCSSColor(raw)) return *color;
+
+    // Vector-like descriptor properties use the same whitespace/comma syntax
+    // as ConvertUIPropertyText(). Keep them typed during interpolation.
+    {
+        std::string normalized=raw;
+        std::replace(normalized.begin(),normalized.end(),',',' ');
+        std::istringstream input(normalized);
+        std::vector<float> values;
+        float value=0.0f;
+        while(input>>value) values.push_back(value);
+        if(input.eof() && values.size()>=2 && values.size()<=4) return values;
+    }
+
+    if(auto scalar=ParseDynamicScalar(raw)) return *scalar;
+    return raw;
+}
+
+std::string FormatDynamicAnimationValue(const DynamicAnimationValue& value) {
+    if(const auto* scalar=std::get_if<DynamicScalar>(&value)) {
+        std::ostringstream stream;
+        stream<<scalar->value<<scalar->suffix;
+        return stream.str();
+    }
+    if(const auto* color=std::get_if<Color>(&value)) {
+        std::ostringstream stream;
+        stream<<'#'<<std::hex<<std::setfill('0')
+              <<std::setw(2)<<static_cast<int>(color->r)
+              <<std::setw(2)<<static_cast<int>(color->g)
+              <<std::setw(2)<<static_cast<int>(color->b)
+              <<std::setw(2)<<static_cast<int>(color->a);
+        return stream.str();
+    }
+    if(const auto* vector=std::get_if<std::vector<float>>(&value)) {
+        std::ostringstream stream;
+        for(std::size_t index=0;index<vector->size();++index) {
+            if(index) stream<<' ';
+            stream<<(*vector)[index];
+        }
+        return stream.str();
+    }
+    return std::get<std::string>(value);
+}
+
+DynamicAnimationValue InterpolateDynamicAnimationValue(
+    const DynamicAnimationValue& from,
+    const DynamicAnimationValue& to,
+    float progress
+) {
+    progress=std::clamp(progress,0.0f,1.0f);
+    if(from.index()!=to.index()) return progress<1.0f?from:to;
+
+    if(const auto* a=std::get_if<DynamicScalar>(&from)) {
+        const auto& b=std::get<DynamicScalar>(to);
+        if(a->suffix!=b.suffix) return progress<1.0f?from:to;
+        return DynamicScalar{Lerp(a->value,b.value,progress),b.suffix};
+    }
+    if(const auto* a=std::get_if<Color>(&from)) {
+        return MixColors(*a,std::get<Color>(to),progress);
+    }
+    if(const auto* a=std::get_if<std::vector<float>>(&from)) {
+        const auto& b=std::get<std::vector<float>>(to);
+        if(a->size()!=b.size()) return progress<1.0f?from:to;
+        std::vector<float> result(a->size());
+        for(std::size_t index=0;index<a->size();++index) {
+            result[index]=Lerp((*a)[index],b[index],progress);
+        }
+        return result;
+    }
+    return progress<1.0f?from:to;
+}
+
+std::optional<std::string> DynamicStyleValue(
+    const ComputedStyle& style,
+    const std::string& property
+) {
+    if(property.rfind("--",0)==0) {
+        if(!style.custom_properties) return std::nullopt;
+        auto found=style.custom_properties->find(property);
+        if(found!=style.custom_properties->end()) return found->second;
+        return std::nullopt;
+    }
+    const std::string prefix="shader-";
+    if(property.size()>prefix.size() &&
+       LowerCSS(property.substr(0,prefix.size()))==prefix) {
+        if(!style.shader_uniforms) return std::nullopt;
+        const std::string name=property.substr(prefix.size());
+        for(const auto& binding:*style.shader_uniforms) {
+            if(binding.name==name) return binding.raw_value;
+        }
+        const std::string lower_name=LowerCSS(name);
+        for(const auto& binding:*style.shader_uniforms) {
+            if(LowerCSS(binding.name)==lower_name) return binding.raw_value;
+        }
+        return std::nullopt;
+    }
+
+    if(style.component_style_properties) {
+        const std::string requested=LowerCSS(TrimCSS(property));
+        auto found=style.component_style_properties->find(requested);
+        if(found!=style.component_style_properties->end()) return found->second;
+    }
+    return std::nullopt;
+}
+
+void ApplyDynamicStyleValue(
+    ComputedStyle& style,
+    const std::string& property,
+    std::string value
+) {
+    if(property.rfind("--",0)==0) {
+        auto values=style.custom_properties
+            ? std::make_shared<UIStyleVariableMap>(*style.custom_properties)
+            : std::make_shared<UIStyleVariableMap>();
+        (*values)[property]=std::move(value);
+        style.custom_properties=std::move(values);
+        return;
+    }
+    const std::string prefix="shader-";
+    if(property.size()>prefix.size() && LowerCSS(property.substr(0,prefix.size()))==prefix) {
+        const std::string requested=property.substr(prefix.size());
+        auto list=style.shader_uniforms
+            ? std::make_shared<UIShaderUniformList>(*style.shader_uniforms)
+            : std::make_shared<UIShaderUniformList>();
+        auto found=std::find_if(list->begin(),list->end(),[&](const UIShaderUniformBinding& binding) {
+            return binding.name==requested || LowerCSS(binding.name)==LowerCSS(requested);
+        });
+        if(found==list->end()) list->push_back({requested,std::move(value)});
+        else found->raw_value=std::move(value);
+        style.shader_uniforms=std::move(list);
+        return;
+    }
+
+    auto values=style.component_style_properties
+        ? std::make_shared<UIStyleVariableMap>(*style.component_style_properties)
+        : std::make_shared<UIStyleVariableMap>();
+    (*values)[LowerCSS(TrimCSS(property))]=std::move(value);
+    style.component_style_properties=std::move(values);
+}
+
+const UITransitionSpec* TransitionForDynamicProperty(
+    const ComputedStyle& style,
+    const std::string& property
+) {
+    const UITransitionSpec* all_match=nullptr;
+    const std::string lower=LowerCSS(property);
+    for(const UITransitionSpec& transition:style.transitions) {
+        if(transition.duration<=0.0f) continue;
+        if(transition.all) all_match=&transition;
+        for(const std::string& candidate:transition.dynamic_properties) {
+            if(LowerCSS(candidate)==lower) return &transition;
+        }
+    }
+    return all_match;
+}
+
+std::vector<std::string> DynamicTransitionNames(const ComputedStyle& style) {
+    std::vector<std::string> result;
+    bool include_all=false;
+    for(const UITransitionSpec& transition:style.transitions) {
+        include_all=include_all||transition.all;
+        for(const std::string& name:transition.dynamic_properties) {
+            if(std::find(result.begin(),result.end(),name)==result.end()) result.push_back(name);
+        }
+    }
+    if(include_all && style.component_style_properties) {
+        for(const auto& pair:*style.component_style_properties) {
+            if(std::find(result.begin(),result.end(),pair.first)==result.end()) result.push_back(pair.first);
+        }
+    }
+    return result;
+}
+
+struct ActiveDynamicTransition {
+    std::string property;
+    DynamicAnimationValue from;
+    DynamicAnimationValue to;
+    double started=0.0;
+    float delay=0.0f;
+    float duration=0.0f;
+    ProgressTween tween;
+
+    ActiveDynamicTransition(
+        std::string name,DynamicAnimationValue a,DynamicAnimationValue b,double now,
+        const UITransitionSpec& spec
+    ) : property(std::move(name)),from(std::move(a)),to(std::move(b)),
+        started(now),delay(spec.delay),duration(spec.duration),
+        tween(MakeProgressTween(spec.easing,spec.duration)) {}
+};
+
+std::string InterpolateDynamicValue(
+    const ActiveDynamicTransition& transition,
+    float progress
+) {
+    return FormatDynamicAnimationValue(
+        InterpolateDynamicAnimationValue(transition.from,transition.to,progress)
+    );
 }
 
 struct ActiveTransition {
@@ -273,9 +572,12 @@ struct ActiveKeyframeAnimation {
 
 struct AnimationChannelState {
     bool initialized=false;
+    std::size_t target_hash=0;
+    std::size_t target_revision=0;
     ComputedStyle target;
     ComputedStyle output;
     std::map<PropertyType,ActiveTransition> transitions;
+    std::map<std::string,ActiveDynamicTransition> dynamic_transitions;
     std::vector<UIAnimationSpec> automatic_specs;
     std::map<std::string,ActiveKeyframeAnimation> players;
 };
@@ -295,6 +597,21 @@ namespace {
 UIElementAnimationState& EnsureAnimationState(UIElementBase& element) {
     if(!element.animation_state) element.animation_state=std::make_shared<UIElementAnimationState>();
     return *element.animation_state;
+}
+
+const std::string& MainAnimationChannelKey() {
+    static const std::string key = "__main";
+    return key;
+}
+
+bool AnimationChannelRequiresTick(const AnimationChannelState& channel) {
+    if(!channel.transitions.empty() || !channel.dynamic_transitions.empty()) return true;
+    for(const auto& entry : channel.players) {
+        const ActiveKeyframeAnimation& player = entry.second;
+        if(player.stopped) return true;
+        if(!player.completed && !player.paused) return true;
+    }
+    return false;
 }
 
 void StartPlayer(AnimationChannelState& channel,UIAnimationSpec spec,double now,bool restart) {
@@ -476,23 +793,87 @@ void ApplyKeyframePlayer(
         auto a=StylePropertyValue(from,property),b=StylePropertyValue(to,property);
         if(a&&b) ApplyAnimatedProperty(output,property,InterpolatePropertyValue(*a,*b,local));
     }
+    std::set<std::string> dynamic_names;
+    for(const auto& declaration:lower->component_style_properties) {
+        dynamic_names.insert(LowerCSS(TrimCSS(declaration.name)));
+    }
+    for(const auto& declaration:upper->component_style_properties) {
+        dynamic_names.insert(LowerCSS(TrimCSS(declaration.name)));
+    }
+    auto step_value=[&](const UIKeyframeStep& step,const std::string& name)->std::optional<std::string> {
+        for(const auto& declaration:step.component_style_properties) {
+            if(LowerCSS(TrimCSS(declaration.name))!=name) continue;
+            if(underlying.custom_properties) {
+                if(auto resolved=ResolveCSSVariables(declaration.raw_value,*underlying.custom_properties)) {
+                    return *resolved;
+                }
+            }
+            return declaration.raw_value;
+        }
+        return DynamicStyleValue(underlying,name);
+    };
+    for(const std::string& name:dynamic_names) {
+        auto a=step_value(*lower,name);
+        auto b=step_value(*upper,name);
+        if(!a || !b) continue;
+        const DynamicAnimationValue from_value=ParseDynamicAnimationValue(*a);
+        const DynamicAnimationValue to_value=ParseDynamicAnimationValue(*b);
+        ApplyDynamicStyleValue(
+            output,name,
+            FormatDynamicAnimationValue(
+                InterpolateDynamicAnimationValue(from_value,to_value,local)
+            )
+        );
+    }
 }
 
 } // namespace
 
-ComputedStyle ResolveAnimatedStyle(
+const ComputedStyle& ResolveAnimatedStyleRef(
     UIElementBase& element,
     const StyleSheet& style_sheet,
-    ComputedStyle target_style,
-    const std::string& channel_name
+    const ComputedStyle& target_style,
+    const std::string& channel_name,
+    std::size_t target_revision
 ) {
+    // Static elements return their retained target directly. No channel map,
+    // full-style copy, or animation hash is needed.
+    if(
+        !element.animation_state &&
+        target_style.transitions.empty() &&
+        target_style.animations.empty()
+    ) {
+        return target_style;
+    }
+
     UIElementAnimationState& state=EnsureAnimationState(element);
-    const std::string channel_key=channel_name.empty()?std::string("__main"):channel_name;
+    const std::string& channel_key = channel_name.empty()
+        ? MainAnimationChannelKey()
+        : channel_name;
     AnimationChannelState& channel=state.channels[channel_key];
+    const bool revision_keyed = target_revision != 0;
+    const std::size_t target_hash = revision_keyed
+        ? 0
+        : HashVisualAnimationTarget(target_style);
+    const bool same_target = revision_keyed
+        ? channel.target_revision == target_revision
+        : channel.target_hash == target_hash;
+
+    if(
+        channel.initialized &&
+        state.pending.empty() &&
+        same_target &&
+        !AnimationChannelRequiresTick(channel)
+    ) {
+        return channel.output;
+    }
+
     const double now=GetTime();
 
     if(!channel.initialized) {
         channel.initialized=true;
+        channel.target_hash=target_hash;
+        channel.target_revision=target_revision;
         channel.target=target_style;
         channel.output=target_style;
         SyncAutomaticPlayers(channel,target_style.animations,now);
@@ -515,6 +896,19 @@ ComputedStyle ResolveAnimatedStyle(
             if(elapsed>=transition.duration) iterator=channel.transitions.erase(iterator);
             else ++iterator;
         }
+        for(auto iterator=channel.dynamic_transitions.begin();iterator!=channel.dynamic_transitions.end();) {
+            ActiveDynamicTransition& transition=iterator->second;
+            const double elapsed=now-transition.started-transition.delay;
+            float progress=0.0f;
+            if(elapsed>0.0) {
+                progress=transition.tween.seek(static_cast<uint32_t>(
+                    std::min<double>(transition.duration*1000.0,elapsed*1000.0)
+                ));
+            }
+            ApplyDynamicStyleValue(current,transition.property,InterpolateDynamicValue(transition,progress));
+            if(elapsed>=transition.duration) iterator=channel.dynamic_transitions.erase(iterator);
+            else ++iterator;
+        }
         channel.output=current;
 
         for(PropertyType property:AnimatableProperties()) {
@@ -530,6 +924,24 @@ ComputedStyle ResolveAnimatedStyle(
                 std::piecewise_construct,
                 std::forward_as_tuple(property),
                 std::forward_as_tuple(property,*visible,*next,now,*spec)
+            );
+        }
+        for(const std::string& property:DynamicTransitionNames(target_style)) {
+            auto previous=DynamicStyleValue(channel.target,property);
+            auto next=DynamicStyleValue(target_style,property);
+            if(!previous || !next || *previous==*next) continue;
+            const UITransitionSpec* spec=TransitionForDynamicProperty(target_style,property);
+            if(!spec) { channel.dynamic_transitions.erase(property); continue; }
+            DynamicAnimationValue from=ParseDynamicAnimationValue(*previous);
+            DynamicAnimationValue to=ParseDynamicAnimationValue(*next);
+            if(auto visible=DynamicStyleValue(channel.output,property)) {
+                from=ParseDynamicAnimationValue(*visible);
+            }
+            channel.dynamic_transitions.erase(property);
+            channel.dynamic_transitions.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(property),
+                std::forward_as_tuple(property,std::move(from),std::move(to),now,*spec)
             );
         }
         channel.target=target_style;
@@ -552,6 +964,20 @@ ComputedStyle ResolveAnimatedStyle(
         else ++iterator;
     }
 
+    for(auto iterator=channel.dynamic_transitions.begin();iterator!=channel.dynamic_transitions.end();) {
+        ActiveDynamicTransition& transition=iterator->second;
+        const double elapsed=now-transition.started-transition.delay;
+        float progress=0.0f;
+        if(elapsed>0.0) {
+            progress=transition.tween.seek(static_cast<uint32_t>(
+                std::min<double>(transition.duration*1000.0,elapsed*1000.0)
+            ));
+        }
+        ApplyDynamicStyleValue(output,transition.property,InterpolateDynamicValue(transition,progress));
+        if(elapsed>=transition.duration) iterator=channel.dynamic_transitions.erase(iterator);
+        else ++iterator;
+    }
+
     for(auto iterator=channel.players.begin();iterator!=channel.players.end();) {
         ApplyKeyframePlayer(output,iterator->second,style_sheet,target_style,now);
         bool before=false,finished=false;
@@ -562,8 +988,21 @@ ComputedStyle ResolveAnimatedStyle(
         if(iterator->second.stopped||!retain) iterator=channel.players.erase(iterator);
         else ++iterator;
     }
-    channel.output=output;
-    return output;
+    channel.target_hash=target_hash;
+    channel.target_revision=target_revision;
+    channel.output=std::move(output);
+    return channel.output;
+}
+
+ComputedStyle ResolveAnimatedStyle(
+    UIElementBase& element,
+    const StyleSheet& style_sheet,
+    ComputedStyle target_style,
+    const std::string& channel_name
+) {
+    return ResolveAnimatedStyleRef(
+        element,style_sheet,target_style,channel_name,0
+    );
 }
 
 namespace {

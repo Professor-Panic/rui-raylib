@@ -1,0 +1,259 @@
+diff -ruN '--exclude=err.log' rui4_orig/include/css_emulator.h rui4/include/css_emulator.h
+--- a/include/css_emulator.h	2026-10-28 07:38:13.892775593 +0000
++++ b/include/css_emulator.h	2026-10-28 07:38:13.949869567 +0000
+@@ -1208,6 +1208,22 @@
+ 
+ Font ResolveUIFont(const std::string& name);
+ 
++// Draws text on whole-pixel coordinates. The glyph atlas is sampled with a
++// bilinear filter, so a fractional position (for example the vertical-centering
++// half pixel) smears small text. Every text draw goes through this.
++inline void DrawUIText(
++    Font font,
++    const char* text,
++    Vector2 position,
++    float font_size,
++    float spacing,
++    Color tint
++) {
++    position.x = std::round(position.x);
++    position.y = std::round(position.y);
++    DrawTextEx(font,text,position,font_size,spacing,tint);
++}
++
+ void ClearTextMeasureCache();
+ 
+ bool AddUIFont(
+@@ -7372,7 +7388,7 @@
+             ApplyStyleOpacity(draw_style.text_color,draw_style.opacity),
+             editing
+         );
+-        DrawTextEx(
++        DrawUIText(
+             value_font,
+             value_text.c_str(),
+             position,
+@@ -7505,7 +7521,7 @@
+         )
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         label_font,
+         input.text.c_str(),
+         {
+@@ -7567,7 +7583,7 @@
+             ApplyStyleOpacity(draw_style.text_color,draw_style.opacity),
+             editing
+         );
+-        DrawTextEx(
++        DrawUIText(
+             value_font,
+             value_text.c_str(),
+             position,
+@@ -7677,7 +7693,7 @@
+         std::max(0.0f,label_rect.height-label_style.padding.top-label_style.padding.bottom)
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         label_font,
+         label_text.c_str(),
+         {
+@@ -7766,7 +7782,7 @@
+             (content.height-text_size.y)*0.5f
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         input.text.c_str(),
+         text_position,
+@@ -7865,7 +7881,7 @@
+                 1.0f
+             );
+ 
+-            DrawTextEx(
++            DrawUIText(
+                 font,
+                 caption,
+                 {
+diff -ruN '--exclude=err.log' rui4_orig/src/rui/css_emulator_draw.cpp rui4/src/rui/css_emulator_draw.cpp
+--- a/src/rui/css_emulator_draw.cpp	2026-10-28 07:38:13.892698786 +0000
++++ b/src/rui/css_emulator_draw.cpp	2026-10-28 07:38:13.954528620 +0000
+@@ -71,7 +71,7 @@
+             (content.height - text_size.y) * 0.5f
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         label.text.c_str(),
+         text_position,
+@@ -145,7 +145,7 @@
+             (content.height - text_size.y) * 0.5f
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         button.text.c_str(),
+         text_position,
+@@ -325,7 +325,7 @@
+     };
+     Font font = ResolveUIFont(style.font);
+     Vector2 text_size = MeasureTextCached(font,text.c_str(),style.font_size,1.0f);
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         text.c_str(),
+         {
+@@ -1220,7 +1220,7 @@
+         input.focused && !showing_placeholder
+     );
+ 
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         value_text.c_str(),
+         text_position,
+@@ -1358,7 +1358,7 @@
+             ) * 0.5f
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         input.text.c_str(),
+         text_position,
+@@ -1693,7 +1693,7 @@
+         content.height
+     };
+ 
+-    DrawTextEx(
++    DrawUIText(
+         font,
+         value_text.c_str(),
+         {
+@@ -1908,7 +1908,7 @@
+     Font close_font = ResolveUIFont(draw_style.font);
+     Vector2 close_size = MeasureTextCached(close_font, close_text, 14.0f, 1.0f);
+ 
+-    DrawTextEx(
++    DrawUIText(
+         close_font,
+         close_text,
+         {
+diff -ruN '--exclude=err.log' rui4_orig/src/rui/css_emulator_style.cpp rui4/src/rui/css_emulator_style.cpp
+--- a/src/rui/css_emulator_style.cpp	2026-10-28 07:38:13.892244671 +0000
++++ b/src/rui/css_emulator_style.cpp	2026-10-28 07:38:13.952801373 +0000
+@@ -2670,7 +2670,7 @@
+                 GetTextX(content,measured.x,style.text_align),
+                 content.y+(content.height-measured.y)*0.5f
+             };
+-            DrawTextEx(
++            DrawUIText(
+                 font,style.generated_content.c_str(),position,style.font_size,1.0f,
+                 ApplyStyleOpacity(style.text_color,style.opacity)
+             );
+diff -ruN '--exclude=err.log' rui4_orig/src/rui/css_emulator_tree.cpp rui4/src/rui/css_emulator_tree.cpp
+--- a/src/rui/css_emulator_tree.cpp	2026-10-28 07:38:13.892068080 +0000
++++ b/src/rui/css_emulator_tree.cpp	2026-10-28 07:38:13.951639630 +0000
+@@ -1409,7 +1409,7 @@
+         const Rectangle item = TabItemRectangle(tabs,index);
+         DrawStyledTextBox(item,tab.title,style,TextAlign::Center);
+         if(tab.closable || tabs.style.tab_closable.value_or(false)) {
+-            DrawTextEx(
++            DrawUIText(
+                 ResolveUIFont(style.font),"x",
+                 {item.x+item.width-item.height*0.55f,item.y+(item.height-style.font_size)*0.5f},
+                 style.font_size,1.0f,style.text_color
+diff -ruN '--exclude=err.log' rui4_orig/src/rui/rui_advanced.cpp rui4/src/rui/rui_advanced.cpp
+--- a/src/rui/rui_advanced.cpp	2026-10-28 07:38:13.892149526 +0000
++++ b/src/rui/rui_advanced.cpp	2026-10-28 07:38:13.952146679 +0000
+@@ -268,14 +268,14 @@
+             tab,
+             active ? dock.style.background_color : DarkenColor(dock.style.background_color,0.14f)
+         );
+-        DrawTextEx(
++        DrawUIText(
+             font,panel->title.c_str(),
+             {tab.x+8.0f,tab.y+(tab.height-dock.style.font_size)*0.5f},
+             dock.style.font_size,1.0f,dock.style.text_color
+         );
+         if(panel->closable) {
+             const Rectangle close = {tab.x+tab.width-20.0f,tab.y+4.0f,16.0f,tab.height-8.0f};
+-            DrawTextEx(font,"x",{close.x+3.0f,close.y},dock.style.font_size,1.0f,dock.style.text_color);
++            DrawUIText(font,"x",{close.x+3.0f,close.y},dock.style.font_size,1.0f,dock.style.text_color);
+         }
+         x += width;
+     }
+@@ -1002,7 +1002,7 @@
+                     const float phase = static_cast<float>(now-text_animation.started)*text_animation.wave_frequency+
+                         static_cast<float>(line.first_character+index)*0.45f;
+                     const float offset = std::sin(phase)*text_animation.wave_amplitude;
+-                    DrawTextEx(font,glyph.c_str(),{x,y+offset},draw_style.font_size,1.0f,base_color);
++                    DrawUIText(font,glyph.c_str(),{x,y+offset},draw_style.font_size,1.0f,base_color);
+                     x += MeasureTextCached(font,glyph.c_str(),draw_style.font_size,1.0f).x;
+                 }
+             }
+@@ -1015,7 +1015,7 @@
+                     const float alpha = std::clamp(newest_age/std::max(0.001f,text_animation.stagger*4.0f),0.0f,1.0f);
+                     color = ApplyStyleOpacity(color,alpha);
+                 }
+-                DrawTextEx(font,shown.c_str(),{content.x,y},draw_style.font_size,1.0f,color);
++                DrawUIText(font,shown.c_str(),{content.x,y},draw_style.font_size,1.0f,color);
+             }
+         }
+         y += line_height;
+@@ -1191,14 +1191,14 @@
+         const UITableColumn& column = columns[column_index];
+         Rectangle header = {x,rect.transform.y,column.width,header_height};
+         DrawRectangleRec(header,DarkenColor(draw_style.background_color,0.10f));
+-        DrawTextEx(
++        DrawUIText(
+             font,column.title.c_str(),
+             {header.x+6.0f,header.y+(header.height-draw_style.font_size)*0.5f},
+             draw_style.font_size,1.0f,draw_style.text_color
+         );
+         if(sort_column == static_cast<int>(column_index)) {
+             const char* arrow = sort_ascending ? "^" : "v";
+-            DrawTextEx(font,arrow,{header.x+header.width-14.0f,header.y+5.0f},draw_style.font_size,1.0f,draw_style.text_color);
++            DrawUIText(font,arrow,{header.x+header.width-14.0f,header.y+5.0f},draw_style.font_size,1.0f,draw_style.text_color);
+         }
+         DrawLineEx({header.x+header.width,header.y},{header.x+header.width,header.y+rect.transform.height},1.0f,draw_style.border_color);
+         x += column.width;
+@@ -1224,7 +1224,7 @@
+             float text_x = cell_x+6.0f;
+             if(column.alignment == TextAlign::Center) text_x = cell_x+(column.width-measured.x)*0.5f;
+             else if(column.alignment == TextAlign::Right) text_x = cell_x+column.width-measured.x-6.0f;
+-            DrawTextEx(font,value.c_str(),{text_x,y+(row_height-draw_style.font_size)*0.5f},draw_style.font_size,1.0f,row.disabled?ApplyStyleOpacity(draw_style.text_color,0.45f):draw_style.text_color);
++            DrawUIText(font,value.c_str(),{text_x,y+(row_height-draw_style.font_size)*0.5f},draw_style.font_size,1.0f,row.disabled?ApplyStyleOpacity(draw_style.text_color,0.45f):draw_style.text_color);
+             cell_x += column.width;
+         }
+     }
+@@ -1540,7 +1540,7 @@
+                 : (index%2 ? DarkenColor(draw_style.background_color,0.035f) : draw_style.background_color);
+             if(hovered_index == static_cast<int>(index)) background = LightenColor(background,0.06f);
+             DrawRectangleRec(item_rectangle,background);
+-            DrawTextEx(
++            DrawUIText(
+                 font,items[index].c_str(),
+                 {item_rectangle.x+draw_style.padding.left,
+                  item_rectangle.y+(item_height-draw_style.font_size)*0.5f},
+@@ -1997,13 +1997,13 @@
+             DarkenColor(draw_style.background_color,0.08f)
+         );
+         Font font = ResolveUIFont(draw_style.font);
+-        DrawTextEx(
++        DrawUIText(
+             font,panel.title.c_str(),
+             {panel.floating_rectangle.x+8.0f,panel.floating_rectangle.y+(tab_height-draw_style.font_size)*0.5f},
+             draw_style.font_size,1.0f,draw_style.text_color
+         );
+         if(panel.closable) {
+-            DrawTextEx(
++            DrawUIText(
+                 font,"x",
+                 {panel.floating_rectangle.x+panel.floating_rectangle.width-18.0f,panel.floating_rectangle.y+4.0f},
+                 draw_style.font_size,1.0f,draw_style.text_color

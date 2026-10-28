@@ -1,3 +1,4 @@
+
 #include "css_emulator.h"
 
 bool RuntimeStyleFlag(
@@ -6,6 +7,8 @@ bool RuntimeStyleFlag(
 ) {
     return value.has_value() ? *value : fallback;
 }
+
+static bool ConstrainHeightToParent(const ComputedStyle& style);
 
 void ApplyRuntimeSizeToElement(
     UIElementBase& rect,
@@ -24,7 +27,9 @@ void ApplyRuntimeSizeToElement(
 
     if(RuntimeStyleFlag(style.runtime_constrain,true)) {
         rect.transform.width = std::min(rect.transform.width,parent_bounds.width);
-        rect.transform.height = std::min(rect.transform.height,parent_bounds.height);
+        if(ConstrainHeightToParent(style)) {
+            rect.transform.height = std::min(rect.transform.height,parent_bounds.height);
+        }
     }
 }
 
@@ -42,7 +47,9 @@ void ApplyRuntimePositionToElement(
         const float maximum_x = std::max(parent_bounds.x,parent_bounds.x+parent_bounds.width-rect.transform.width);
         const float maximum_y = std::max(parent_bounds.y,parent_bounds.y+parent_bounds.height-rect.transform.height);
         rect.transform.x = std::clamp(rect.transform.x,parent_bounds.x,maximum_x);
-        rect.transform.y = std::clamp(rect.transform.y,parent_bounds.y,maximum_y);
+        if(ConstrainHeightToParent(style)) {
+            rect.transform.y = std::clamp(rect.transform.y,parent_bounds.y,maximum_y);
+        }
     }
 }
 
@@ -166,6 +173,82 @@ bool ShouldAutoHeight(const ComputedStyle& style) {
         style.resize_to_content.value_or(false);
 }
 
+StyleSelector MakeSelectorSnapshot(
+    const ComputedStyle& style,
+    const UIElementBase& rect
+) {
+    StyleSelector selector;
+    selector.selector = style.selector;
+    selector.id = style.id;
+    selector.classes = style.classes;
+    selector.pseudo_states = rect.pseudo_states.ActiveNamesView();
+    selector.sibling_index = style.sibling_index;
+    selector.sibling_count = style.sibling_count;
+    return selector;
+}
+
+void InheritSelectorAncestors(
+    ComputedStyle& child_style,
+    const UIContainer& parent,
+    StyleSelectorSiblingChain previous_siblings,
+    bool track_sibling_context,
+    std::size_t sibling_index = 0,
+    std::size_t sibling_count = 0
+) {
+    child_style.sibling_index = sibling_index;
+    child_style.sibling_count = sibling_count;
+    child_style.inherited_custom_properties = parent.style.custom_properties;
+    child_style.inherited_font = parent.style.font;
+    child_style.inherited_text_color = parent.style.text_color;
+    child_style.selector_ancestors =
+        parent.style.selector_ancestors;
+    child_style.selector_ancestors.push_back(
+        MakeSelectorSnapshot(parent.style,parent.rect)
+    );
+
+    if(track_sibling_context) {
+        child_style.selector_ancestor_previous_siblings =
+            parent.style.selector_ancestor_previous_siblings;
+        child_style.selector_ancestor_previous_siblings.push_back(
+            parent.style.selector_previous_siblings
+        );
+        child_style.selector_previous_siblings =
+            std::move(previous_siblings);
+    }
+    else {
+        child_style.selector_ancestor_previous_siblings.clear();
+        child_style.selector_previous_siblings.reset();
+    }
+}
+
+void InheritCompositeContentAncestors(
+    ComputedStyle& content_style,
+    const ComputedStyle& owner_style,
+    const UIElementBase& owner_rect,
+    bool track_sibling_context
+) {
+    content_style.inherited_custom_properties = owner_style.custom_properties;
+    content_style.inherited_font = owner_style.font;
+    content_style.inherited_text_color = owner_style.text_color;
+    content_style.selector_ancestors =
+        owner_style.selector_ancestors;
+    content_style.selector_ancestors.push_back(
+        MakeSelectorSnapshot(owner_style,owner_rect)
+    );
+
+    if(track_sibling_context) {
+        content_style.selector_ancestor_previous_siblings =
+            owner_style.selector_ancestor_previous_siblings;
+        content_style.selector_ancestor_previous_siblings.push_back(
+            owner_style.selector_previous_siblings
+        );
+    }
+    else {
+        content_style.selector_ancestor_previous_siblings.clear();
+    }
+    content_style.selector_previous_siblings.reset();
+}
+
 void ResolveElementLayoutStyle(
     ComputedStyle& style,
     UIElementBase& rect,
@@ -180,12 +263,13 @@ void ResolveElementLayoutStyle(
         style_sheet,selector,style.id,SelectorState::None,style
     );
     style = ResolveStyleWithPseudoStates(
-        style_sheet,selector,style.id,rect.pseudo_states.ActiveNames(),style
+        style_sheet,selector,style.id,rect.pseudo_states.ActiveNamesView(),style
     );
     ResolveComputedLengths(
         style,parent_width,parent_height,parent_font_size,inherited_scale
     );
     style = ResolveLayoutAnimatedStyle(rect,style_sheet,std::move(style));
+    ++rect.style_generation;
 }
 
 Vector2 MeasureContainerContentSize(const UIContainer& ui) {
@@ -315,7 +399,7 @@ bool ResizeRectangleToContent(
             style.max_height
         );
 
-        if(RuntimeStyleFlag(style.runtime_constrain,true)) {
+        if(ConstrainHeightToParent(style)) {
             next = std::min(next,maximum_height);
         }
 
@@ -368,6 +452,14 @@ float MeasureCompositeHeaderWidth(
 
 } // namespace
 
+// Auto-height elements (wrapped text, content-sized boxes) are not squeezed to
+// the space left in the parent unless `runtime-constrain: true` is explicit;
+// they overflow instead, as in CSS (min-height:auto).
+static bool ConstrainHeightToParent(const ComputedStyle& style) {
+    if(style.runtime_constrain.has_value()) return *style.runtime_constrain;
+    return !ShouldAutoHeight(style);
+}
+
 void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float containing_width ,
                     float containing_height ,bool force_layout ) {
     CSS_UI_ACTIVE_STYLE_SHEET = &style_sheet;
@@ -388,10 +480,13 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
         containing_height = static_cast<float>(GetScreenHeight());
     }
 
+    const bool detect_layout_mutations =
+        CSS_UI_DETECT_LAYOUT_MUTATIONS;
+
     const std::size_t current_signature =
-        force_layout
-            ? 0
-            : ComputeContainerLayoutSignature(ui);
+        !force_layout && detect_layout_mutations
+            ? ComputeContainerLayoutSignature(ui)
+            : ui.last_layout_signature;
 
     const bool containing_size_changed =
         containing_width != ui.last_containing_width ||
@@ -405,7 +500,10 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
         !ui.layout_dirty &&
         !containing_size_changed &&
         !stylesheet_changed &&
-        current_signature == ui.last_layout_signature
+        (
+            !detect_layout_mutations ||
+            current_signature == ui.last_layout_signature
+        )
     ) {
         return;
     }
@@ -461,15 +559,16 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
         ui.last_containing_width = containing_width;
         ui.last_containing_height = containing_height;
         ui.last_layout_revision = style_sheet.revision;
-        ui.last_layout_signature =
-            ComputeContainerLayoutSignature(ui);
+        ui.last_layout_signature = detect_layout_mutations
+            ? ComputeContainerLayoutSignature(ui)
+            : 0;
     };
 
     ResolveComputedLengths(
         ui.style,
         containing_width,
         containing_height,
-        20.0f,
+        CSS_UI_ROOT_FONT_SIZE,
         ui.inherited_scale,
         true
     );
@@ -523,12 +622,41 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
     flow_children.reserve(ui.elements.size());
     absolute_children.reserve(ui.elements.size());
 
+    const bool track_sibling_context =
+        style_sheet.uses_sibling_combinators;
+    StyleSelectorSiblingChain previous_siblings;
+    const bool track_structure = style_sheet.uses_structural_selectors;
+    const std::size_t sibling_total = ui.elements.size();
+    std::size_t sibling_position = 0;
+
     for(auto& element : ui.elements) {
         LayoutChild child;
+        ++sibling_position;
 
         std::visit(
             [&](auto& widget) {
                 using T = std::decay_t<decltype(widget)>;
+
+                if constexpr(
+                    IsUICompositePointerV<T> ||
+                    IsUICustomElementPointerV<T>
+                ) {
+                    if(!widget) return;
+                    InheritSelectorAncestors(
+                        widget->style,ui,previous_siblings,
+                        track_sibling_context,
+                        track_structure ? sibling_position : 0,
+                        track_structure ? sibling_total : 0
+                    );
+                }
+                else {
+                    InheritSelectorAncestors(
+                        widget.style,ui,previous_siblings,
+                        track_sibling_context,
+                        track_structure ? sibling_position : 0,
+                        track_structure ? sibling_total : 0
+                    );
+                }
 
                 if constexpr(std::is_same_v<T, UIButton>) {
                     ResolveElementLayoutStyle(
@@ -675,8 +803,19 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                     }
 
                     if(!ShouldAutoHeight(widget.style)) {
+                        widget.rect.transform.height = widget.style.height;
+                    }
+                    else {
+                        Font input_font = ResolveUIFont(widget.style.font);
+                        const float line_height = MeasureTextCached(
+                            input_font, "Ag", widget.style.font_size, 1.0f
+                        ).y;
+
                         widget.rect.transform.height =
-                            widget.style.height;
+                            line_height +
+                            widget.style.padding.top +
+                            widget.style.padding.bottom +
+                            8.0f;                       // same slack the Button branch uses
                     }
 
                     ApplyRuntimeSizeToElement(widget.rect,widget.style,inner);
@@ -730,16 +869,29 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                                     static_cast<float>(widget.texture.height)
                                 };
 
+                        const float frame_width = widget.style.image_frame_size.x > 0.0f
+                            ? widget.style.image_frame_size.x
+                            : widget.frame_size.x;
+                        const float frame_height = widget.style.image_frame_size.y > 0.0f
+                            ? widget.style.image_frame_size.y
+                            : widget.frame_size.y;
+                        const float intrinsic_width = frame_width > 0.0f
+                            ? frame_width
+                            : std::abs(source.width);
+                        const float intrinsic_height = frame_height > 0.0f
+                            ? frame_height
+                            : std::abs(source.height);
+
                         if(ShouldAutoWidth(widget.style)) {
                             widget.rect.transform.width =
-                                std::abs(source.width) +
+                                intrinsic_width +
                                 widget.style.padding.left +
                                 widget.style.padding.right;
                         }
 
                         if(ShouldAutoHeight(widget.style)) {
                             widget.rect.transform.height =
-                                std::abs(source.height) +
+                                intrinsic_height +
                                 widget.style.padding.top +
                                 widget.style.padding.bottom;
                         }
@@ -831,6 +983,12 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                             )
                         };
                         ComputedStyle content_style = selected->content.style;
+                        InheritCompositeContentAncestors(
+                            content_style,
+                            widget->style,
+                            widget->rect,
+                            style_sheet.uses_sibling_combinators
+                        );
                         AddCSSClass(content_style.classes,CSS_UI_TAB_CONTENT_PART);
                         selected->content.style = ResolveStyle(
                             style_sheet,
@@ -1082,6 +1240,13 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                             ComputedStyle content_style =
                                 widget->content.style;
 
+                            InheritCompositeContentAncestors(
+                                content_style,
+                                widget->style,
+                                widget->rect,
+                                style_sheet.uses_sibling_combinators
+                            );
+
                             AddCSSClass(
                                 content_style.classes,
                                 CSS_UI_POPUP_PART
@@ -1210,6 +1375,18 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
         );
 
         if(
+            track_sibling_context &&
+            child.rect != nullptr &&
+            child.transform != nullptr &&
+            child.style != nullptr
+        ) {
+            previous_siblings = AppendStyleSelectorSibling(
+                std::move(previous_siblings),
+                MakeSelectorSnapshot(*child.style,*child.rect)
+            );
+        }
+
+        if(
             child.transform == nullptr ||
             child.style == nullptr ||
             child.style->display == DisplayType::None
@@ -1241,48 +1418,73 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
 
     auto layout_absolute_children = [&]() {
         for(auto& child : absolute_children) {
-            child.transform->x =
-                inner.x + child.style->left;
+            // Optional lengths distinguish an explicit zero from an omitted edge.
+            const bool has_left =
+                child.style->left_length.has_value() || child.style->left != 0.0f;
+            const bool has_right =
+                child.style->right_length.has_value() || child.style->right != 0.0f;
+            const bool has_top =
+                child.style->top_length.has_value() || child.style->top != 0.0f;
+            const bool has_bottom =
+                child.style->bottom_length.has_value() || child.style->bottom != 0.0f;
 
-            child.transform->y =
-                inner.y + child.style->top;
-
-            if(
-                child.style->right != 0.0f &&
-                child.style->left == 0.0f
-            ) {
+            if(has_left && has_right) {
+                child.transform->x = inner.x+child.style->left;
+                child.transform->width = std::max(
+                    0.0f,inner.width-child.style->left-child.style->right
+                );
+            }
+            else if(has_left) {
+                child.transform->x = inner.x+child.style->left;
+            }
+            else if(has_right) {
                 child.transform->x =
-                    inner.x +
-                    inner.width -
-                    child.style->right -
-                    child.transform->width;
+                    inner.x+inner.width-child.style->right-child.transform->width;
+            }
+            else {
+                child.transform->x = inner.x;
             }
 
-            if(
-                child.style->bottom != 0.0f &&
-                child.style->top == 0.0f
-            ) {
+            if(has_top && has_bottom) {
+                child.transform->y = inner.y+child.style->top;
+                child.transform->height = std::max(
+                    0.0f,inner.height-child.style->top-child.style->bottom
+                );
+            }
+            else if(has_top) {
+                child.transform->y = inner.y+child.style->top;
+            }
+            else if(has_bottom) {
                 child.transform->y =
-                    inner.y +
-                    inner.height -
-                    child.style->bottom -
-                    child.transform->height;
+                    inner.y+inner.height-child.style->bottom-child.transform->height;
+            }
+            else {
+                child.transform->y = inner.y;
             }
 
             ApplyRuntimeSizeToElement(*child.rect,*child.style,inner);
             ApplyRuntimePositionToElement(*child.rect,*child.style,inner);
+            if (child.style->transform_operations||child.style->perspective.has_value()) {
+                EvaluateTransformMatrix(*child.style, *child.transform, inner.width, inner.height, child.style->font_size, CSS_UI_ROOT_FONT_SIZE, CSS_UI_VIEWPORT_WIDTH, CSS_UI_VIEWPORT_HEIGHT);
+            }
             apply_scroll(child);
 
             if(child.container != nullptr) {
                 LayoutContainerPass(
                     *child.container,
                     style_sheet,
-                    ShouldAutoWidth(*child.style)
-                        ? inner.width
-                        : child.transform->width,
-                    ShouldAutoHeight(*child.style)
-                        ? inner.height
-                        : child.transform->height,
+                    // By this point this pass has already resolved child.transform
+                    // (explicit size, flex-basis+grow/shrink, stretch, grid track, or
+                    // absolute left/right/top/bottom) - that resolved size is always
+                    // the correct space to recurse into, never the parent's raw inner
+                    // box. Falling back to inner.width/height here whenever the child
+                    // merely lacks an explicit width/height (ShouldAutoWidth/Height)
+                    // fed the *parent's entire remaining space* into children that had
+                    // already been sized to a much smaller share of it (e.g. a flex:1
+                    // panel that only got part of its parent's height), which is what
+                    // let auto-height flex/grid items balloon past their allotted box.
+                    child.transform->width,
+                    child.transform->height,
                     true
                 );
             }
@@ -1317,13 +1519,57 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
             inner.width,
             horizontal_gap
         );
-        const std::vector<float> row_sizes = ResolveGridTrackSizes(
+        std::vector<float> row_sizes = ResolveGridTrackSizes(
             ui.style.grid_row_tracks,
             ui.style.grid_auto_row,
             rows,
             inner.height,
             vertical_gap
         );
+
+        float grid_cross_start = 0.0f;
+        float grid_row_spacing = vertical_gap;
+        if(ui.style.align_content.has_value() && !row_sizes.empty()) {
+            float used_cross = vertical_gap * static_cast<float>(row_sizes.size()-1);
+            for(float size : row_sizes) used_cross += size;
+            float free_cross = std::max(0.0f,inner.height-used_cross);
+
+            switch(*ui.style.align_content) {
+                case AlignContent::Stretch:
+                    // Fixed grid tracks do not become flexible merely because
+                    // align-content is stretch. Auto/fr tracks already consume
+                    // available space in ResolveGridTrackSizes().
+                    break;
+                case AlignContent::Center:
+                    grid_cross_start = free_cross*0.5f;
+                    break;
+                case AlignContent::FlexEnd:
+                    grid_cross_start = free_cross;
+                    break;
+                case AlignContent::SpaceBetween:
+                    if(row_sizes.size()>1) {
+                        grid_row_spacing += free_cross/static_cast<float>(row_sizes.size()-1);
+                    }
+                    break;
+                case AlignContent::SpaceAround:
+                    if(!row_sizes.empty()) {
+                        const float extra = free_cross/static_cast<float>(row_sizes.size());
+                        grid_row_spacing += extra;
+                        grid_cross_start = extra*0.5f;
+                    }
+                    break;
+                case AlignContent::SpaceEvenly:
+                    if(!row_sizes.empty()) {
+                        const float extra = free_cross/static_cast<float>(row_sizes.size()+1);
+                        grid_row_spacing += extra;
+                        grid_cross_start = extra;
+                    }
+                    break;
+                case AlignContent::FlexStart:
+                default:
+                    break;
+            }
+        }
 
         for(std::size_t index = 0;
             index < flow_children.size();
@@ -1373,23 +1619,33 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
 
             Rectangle cell = {
                 inner.x + GridTrackOffset(column_sizes,column,horizontal_gap),
-                inner.y + GridTrackOffset(row_sizes,row,vertical_gap),
+                inner.y + grid_cross_start + GridTrackOffset(row_sizes,row,grid_row_spacing),
                 GridTrackSpan(column_sizes,column,column_span,horizontal_gap),
-                GridTrackSpan(row_sizes,row,row_span,vertical_gap)
+                GridTrackSpan(row_sizes,row,row_span,grid_row_spacing)
             };
+
+            const bool auto_left =
+                IsAutoCSSLength(child.style->margin_lengths.left);
+            const bool auto_right =
+                IsAutoCSSLength(child.style->margin_lengths.right);
+            const bool auto_top =
+                IsAutoCSSLength(child.style->margin_lengths.top);
+            const bool auto_bottom =
+                IsAutoCSSLength(child.style->margin_lengths.bottom);
+
+            const float fixed_left = auto_left ? 0.0f : child.style->margin.left;
+            const float fixed_right = auto_right ? 0.0f : child.style->margin.right;
+            const float fixed_top = auto_top ? 0.0f : child.style->margin.top;
+            const float fixed_bottom = auto_bottom ? 0.0f : child.style->margin.bottom;
 
             float content_width = std::max(
                 0.0f,
-                cell.width -
-                    child.style->margin.left -
-                    child.style->margin.right
+                cell.width - fixed_left - fixed_right
             );
 
             float content_height = std::max(
                 0.0f,
-                cell.height -
-                    child.style->margin.top -
-                    child.style->margin.bottom
+                cell.height - fixed_top - fixed_bottom
             );
 
             AlignSelf alignment =
@@ -1404,46 +1660,97 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                 );
             }
 
-            const AlignItems horizontal_alignment = ui.style.justify_items;
-            child.transform->x = cell.x + child.style->margin.left;
-            child.transform->y = cell.y + child.style->margin.top;
+            AlignItems horizontal_alignment = ui.style.justify_items;
+            if(child.style->justify_self != JustifySelf::Auto) {
+                horizontal_alignment = static_cast<AlignItems>(
+                    static_cast<int>(child.style->justify_self)-1
+                );
+            }
+            const bool horizontal_auto_margin = auto_left || auto_right;
+            const bool vertical_auto_margin = auto_top || auto_bottom;
 
-            if(horizontal_alignment == AlignItems::Stretch) {
+            if(
+                horizontal_alignment == AlignItems::Stretch &&
+                !horizontal_auto_margin
+            ) {
                 child.transform->width = content_width;
             }
-            else if(horizontal_alignment == AlignItems::Center) {
-                child.transform->x += (content_width-child.transform->width)*0.5f;
-            }
-            else if(horizontal_alignment == AlignItems::FlexEnd) {
-                child.transform->x = cell.x+cell.width-child.style->margin.right-child.transform->width;
-            }
 
-            if(vertical_alignment == AlignItems::Stretch) {
+            if(
+                vertical_alignment == AlignItems::Stretch &&
+                !vertical_auto_margin
+            ) {
                 child.transform->height = content_height;
             }
-            else if(vertical_alignment == AlignItems::Center) {
-                child.transform->y += (content_height-child.transform->height)*0.5f;
+
+            if(horizontal_auto_margin) {
+                const float free_horizontal = std::max(
+                    0.0f,
+                    cell.width - fixed_left - fixed_right - child.transform->width
+                );
+                const int auto_count =
+                    static_cast<int>(auto_left) + static_cast<int>(auto_right);
+                const float auto_share = auto_count > 0
+                    ? free_horizontal / static_cast<float>(auto_count)
+                    : 0.0f;
+                child.transform->x =
+                    cell.x + fixed_left + (auto_left ? auto_share : 0.0f);
             }
-            else if(vertical_alignment == AlignItems::FlexEnd) {
-                child.transform->y = cell.y+cell.height-child.style->margin.bottom-child.transform->height;
+            else {
+                child.transform->x = cell.x + fixed_left;
+                if(horizontal_alignment == AlignItems::Center) {
+                    child.transform->x +=
+                        (content_width-child.transform->width)*0.5f;
+                }
+                else if(horizontal_alignment == AlignItems::FlexEnd) {
+                    child.transform->x =
+                        cell.x+cell.width-fixed_right-child.transform->width;
+                }
+            }
+
+            if(vertical_auto_margin) {
+                const float free_vertical = std::max(
+                    0.0f,
+                    cell.height - fixed_top - fixed_bottom - child.transform->height
+                );
+                const int auto_count =
+                    static_cast<int>(auto_top) + static_cast<int>(auto_bottom);
+                const float auto_share = auto_count > 0
+                    ? free_vertical / static_cast<float>(auto_count)
+                    : 0.0f;
+                child.transform->y =
+                    cell.y + fixed_top + (auto_top ? auto_share : 0.0f);
+            }
+            else {
+                child.transform->y = cell.y + fixed_top;
+                if(vertical_alignment == AlignItems::Center) {
+                    child.transform->y +=
+                        (content_height-child.transform->height)*0.5f;
+                }
+                else if(vertical_alignment == AlignItems::FlexEnd) {
+                    child.transform->y =
+                        cell.y+cell.height-fixed_bottom-child.transform->height;
+                }
             }
 
             ApplyRuntimeSizeToElement(*child.rect,*child.style,cell);
 
             apply_relative_position(child);
             ApplyRuntimePositionToElement(*child.rect,*child.style,inner);
+            if (child.style->transform_operations) {
+                EvaluateTransformMatrix(*child.style, *child.transform, inner.width, inner.height, child.style->font_size, CSS_UI_ROOT_FONT_SIZE, CSS_UI_VIEWPORT_WIDTH, CSS_UI_VIEWPORT_HEIGHT);
+            }
             apply_scroll(child);
 
             if(child.container != nullptr) {
                 LayoutContainerPass(
                     *child.container,
                     style_sheet,
-                    ShouldAutoWidth(*child.style)
-                        ? inner.width
-                        : child.transform->width,
-                    ShouldAutoHeight(*child.style)
-                        ? inner.height
-                        : child.transform->height,
+                    // See the comment on the first recursive LayoutContainerPass
+                    // call in this file: always recurse with the size this pass
+                    // already resolved for this child, not the parent's raw inner box.
+                    child.transform->width,
+                    child.transform->height,
                     true
                 );
             }
@@ -1460,316 +1767,545 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
             ? ui.style.flex_direction
             : ui.direction;
 
-    float available_main =
+    const float available_main =
         direction == FlexDirection::Row
             ? inner.width
             : inner.height;
+    const float available_cross =
+        direction == FlexDirection::Row
+            ? inner.height
+            : inner.width;
 
-    if(ui.style.gap_length.has_value()) {
-        ui.style.gap = ResolveCSSLength(
-            *ui.style.gap_length,
-            available_main
-        );
-    }
+    const bool cross_axis_is_auto =
+        direction == FlexDirection::Row
+            ? ShouldAutoHeight(ui.style)
+            : ShouldAutoWidth(ui.style);
 
-    float total_main = 0.0f;
-    float total_grow = 0.0f;
-    float total_shrink = 0.0f;
+    // In flex layout CSS gap is axis-aware: row-gap separates rows and
+    // column-gap separates columns. For a column flex container those axes
+    // swap relative to main/cross.
+    const float main_gap =
+        direction == FlexDirection::Row
+            ? ui.style.column_gap
+            : ui.style.row_gap;
+    const float cross_gap =
+        direction == FlexDirection::Row
+            ? ui.style.row_gap
+            : ui.style.column_gap;
 
+    const bool wrapping =
+        ui.style.display == DisplayType::Flex &&
+        ui.style.flex_wrap != FlexWrap::NoWrap;
+    const bool wrap_reverse =
+        ui.style.display == DisplayType::Flex &&
+        ui.style.flex_wrap == FlexWrap::WrapReverse;
+
+    const auto main_before_is_auto = [&](const LayoutChild& child) {
+        return direction == FlexDirection::Row
+            ? IsAutoCSSLength(child.style->margin_lengths.left)
+            : IsAutoCSSLength(child.style->margin_lengths.top);
+    };
+
+    const auto main_after_is_auto = [&](const LayoutChild& child) {
+        return direction == FlexDirection::Row
+            ? IsAutoCSSLength(child.style->margin_lengths.right)
+            : IsAutoCSSLength(child.style->margin_lengths.bottom);
+    };
+
+    const auto main_before_margin = [&](const LayoutChild& child) {
+        if(main_before_is_auto(child)) return 0.0f;
+        return direction == FlexDirection::Row
+            ? child.style->margin.left
+            : child.style->margin.top;
+    };
+
+    const auto main_after_margin = [&](const LayoutChild& child) {
+        if(main_after_is_auto(child)) return 0.0f;
+        return direction == FlexDirection::Row
+            ? child.style->margin.right
+            : child.style->margin.bottom;
+    };
+
+    const auto cross_before_is_auto = [&](const LayoutChild& child) {
+        return direction == FlexDirection::Row
+            ? IsAutoCSSLength(child.style->margin_lengths.top)
+            : IsAutoCSSLength(child.style->margin_lengths.left);
+    };
+
+    const auto cross_after_is_auto = [&](const LayoutChild& child) {
+        return direction == FlexDirection::Row
+            ? IsAutoCSSLength(child.style->margin_lengths.bottom)
+            : IsAutoCSSLength(child.style->margin_lengths.right);
+    };
+
+    const auto cross_before_margin = [&](const LayoutChild& child) {
+        if(cross_before_is_auto(child)) return 0.0f;
+        return direction == FlexDirection::Row
+            ? child.style->margin.top
+            : child.style->margin.left;
+    };
+
+    const auto cross_after_margin = [&](const LayoutChild& child) {
+        if(cross_after_is_auto(child)) return 0.0f;
+        return direction == FlexDirection::Row
+            ? child.style->margin.bottom
+            : child.style->margin.right;
+    };
+
+    const auto child_main_size = [&](const LayoutChild& child) {
+        return direction == FlexDirection::Row
+            ? child.transform->width
+            : child.transform->height;
+    };
+
+    const auto child_cross_size = [&](const LayoutChild& child) {
+        return direction == FlexDirection::Row
+            ? child.transform->height
+            : child.transform->width;
+    };
+
+    // Resolve basis once before line breaking. No per-line temporary child
+    // copies are needed; FlexLine stores only index ranges and scalar totals.
     for(auto& child : flow_children) {
         if(child.style->flex_basis_length.has_value()) {
             child.style->flex_basis = ResolveCSSLength(
                 *child.style->flex_basis_length,
-                available_main
+                available_main,
+                child.style->font_size,
+                CSS_UI_ROOT_FONT_SIZE,
+                child.style->custom_properties.get()
             );
         }
 
         if(child.style->flex_basis >= 0.0f) {
             if(direction == FlexDirection::Row) {
-                child.transform->width =
-                    child.style->flex_basis;
+                child.transform->width = child.style->flex_basis;
             }
             else {
-                child.transform->height =
-                    child.style->flex_basis;
+                child.transform->height = child.style->flex_basis;
             }
         }
-
-        float size =
-            direction == FlexDirection::Row
-                ? child.transform->width
-                : child.transform->height;
-
-        float before =
-            direction == FlexDirection::Row
-                ? child.style->margin.left
-                : child.style->margin.top;
-
-        float after =
-            direction == FlexDirection::Row
-                ? child.style->margin.right
-                : child.style->margin.bottom;
-
-        total_main += size + before + after;
-        total_grow += child.style->flex_grow;
-
-        total_shrink +=
-            child.style->flex_shrink *
-            std::max(1.0f,size);
     }
 
-    if(flow_children.size() > 1) {
-        total_main +=
-            ui.style.gap *
-            static_cast<float>(
-                flow_children.size() - 1
-            );
-    }
+    struct FlexLine {
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        float base_main = 0.0f;
+        float cross_size = 0.0f;
+        float cross_offset = 0.0f;
+        float total_grow = 0.0f;
+        float total_shrink = 0.0f;
+        std::size_t auto_main_margins = 0;
+    };
 
-    float free_space =
-        available_main - total_main;
+    // In a column, auto-height children keep their content height instead of
+    // being shrunk below it (CSS min-height:auto), unless runtime-constrain is
+    // explicitly enabled.
+    const auto shrink_weight = [&](const LayoutChild& child) {
+        if(
+            direction != FlexDirection::Row &&
+            ShouldAutoHeight(*child.style) &&
+            !child.style->runtime_constrain.value_or(false)
+        ) return 0.0f;
+        return child.style->flex_shrink;
+    };
 
-    if(
-        free_space > 0.0f &&
-        total_grow > 0.0f
-    ) {
-        for(auto& child : flow_children) {
-            float addition =
-                free_space *
-                child.style->flex_grow /
-                total_grow;
+    const auto append_to_line = [&](FlexLine& target, std::size_t index) {
+        LayoutChild& child = flow_children[index];
+        const float outer_main =
+            child_main_size(child) +
+            main_before_margin(child) +
+            main_after_margin(child);
+        const float outer_cross =
+            child_cross_size(child) +
+            cross_before_margin(child) +
+            cross_after_margin(child);
 
-            if(direction == FlexDirection::Row) {
-                child.transform->width += addition;
+        if(target.end > target.begin) target.base_main += main_gap;
+        target.base_main += outer_main;
+        target.cross_size = std::max(target.cross_size,outer_cross);
+        target.total_grow += child.style->flex_grow;
+        target.total_shrink +=
+            shrink_weight(child) *
+            std::max(1.0f,child_main_size(child));
+        target.auto_main_margins +=
+            static_cast<std::size_t>(main_before_is_auto(child)) +
+            static_cast<std::size_t>(main_after_is_auto(child));
+        target.end = index+1;
+    };
+
+    const auto layout_line = [&](FlexLine& current) {
+        float free_space = available_main-current.base_main;
+
+        if(free_space > 0.0f && current.total_grow > 0.0f) {
+            for(std::size_t index=current.begin; index<current.end; ++index) {
+                LayoutChild& child = flow_children[index];
+                const float addition =
+                    free_space * child.style->flex_grow/current.total_grow;
+                if(direction == FlexDirection::Row) {
+                    child.transform->width += addition;
+                }
+                else {
+                    child.transform->height += addition;
+                }
             }
-            else {
-                child.transform->height += addition;
+            free_space = 0.0f;
+        }
+        else if(free_space < 0.0f && current.total_shrink > 0.0f) {
+            for(std::size_t index=current.begin; index<current.end; ++index) {
+                LayoutChild& child = flow_children[index];
+                const float size = child_main_size(child);
+                const float reduction =
+                    (-free_space) *
+                    (shrink_weight(child)*std::max(1.0f,size)) /
+                    current.total_shrink;
+                if(direction == FlexDirection::Row) {
+                    child.transform->width =
+                        std::max(0.0f,child.transform->width-reduction);
+                }
+                else {
+                    child.transform->height =
+                        std::max(0.0f,child.transform->height-reduction);
+                }
             }
+            free_space = 0.0f;
         }
 
-        free_space = 0.0f;
-    }
-    else if(
-        free_space < 0.0f &&
-        total_shrink > 0.0f
-    ) {
-        for(auto& child : flow_children) {
-            float size =
-                direction == FlexDirection::Row
-                    ? child.transform->width
-                    : child.transform->height;
+        float auto_main_margin = 0.0f;
+        if(free_space > 0.0f && current.auto_main_margins > 0) {
+            auto_main_margin =
+                free_space/static_cast<float>(current.auto_main_margins);
+            free_space = 0.0f;
+        }
 
-            float reduction =
-                (-free_space) *
-                (
-                    child.style->flex_shrink *
-                    std::max(1.0f,size)
-                ) /
-                total_shrink;
+        const float distributable = std::max(0.0f,free_space);
+        float start_offset = 0.0f;
+        float spacing = main_gap;
+        const std::size_t count = current.end-current.begin;
 
-            if(direction == FlexDirection::Row) {
-                child.transform->width = std::max(
-                    0.0f,
-                    child.transform->width -
-                        reduction
+        switch(ui.style.justify_content) {
+            case JustifyContent::Center:
+                start_offset = distributable*0.5f;
+                break;
+            case JustifyContent::FlexEnd:
+                start_offset = distributable;
+                break;
+            case JustifyContent::SpaceBetween:
+                if(count>1) {
+                    spacing += distributable/static_cast<float>(count-1);
+                }
+                break;
+            case JustifyContent::SpaceAround:
+                if(count>0) {
+                    const float extra = distributable/static_cast<float>(count);
+                    spacing += extra;
+                    start_offset = extra*0.5f;
+                }
+                break;
+            case JustifyContent::SpaceEvenly:
+                if(count>0) {
+                    const float extra = distributable/static_cast<float>(count+1);
+                    spacing += extra;
+                    start_offset = extra;
+                }
+                break;
+            case JustifyContent::FlexStart:
+            default:
+                break;
+        }
+
+        const float main_origin =
+            direction == FlexDirection::Row ? inner.x : inner.y;
+        float cursor = main_origin + start_offset;
+
+        float physical_cross_offset = current.cross_offset;
+        if(wrap_reverse) {
+            physical_cross_offset =
+                available_cross-current.cross_offset-current.cross_size;
+        }
+        const float line_cross_origin =
+            (direction == FlexDirection::Row ? inner.y : inner.x) +
+            physical_cross_offset;
+
+        for(std::size_t index=current.begin; index<current.end; ++index) {
+            LayoutChild& child = flow_children[index];
+
+            AlignItems effective = ui.style.align_items;
+            if(child.style->align_self != AlignSelf::Auto) {
+                effective = static_cast<AlignItems>(
+                    static_cast<int>(child.style->align_self)-1
                 );
             }
-            else {
-                child.transform->height = std::max(
-                    0.0f,
-                    child.transform->height -
-                        reduction
-                );
-            }
-        }
 
-        free_space = 0.0f;
-    }
-
-    float start_offset = 0.0f;
-    float spacing = ui.style.gap;
-
-    std::size_t count =
-        flow_children.size();
-
-    switch(ui.style.justify_content) {
-        case JustifyContent::Center:
-            start_offset =
-                free_space * 0.5f;
-            break;
-
-        case JustifyContent::FlexEnd:
-            start_offset =
-                free_space;
-            break;
-
-        case JustifyContent::SpaceBetween:
-            if(count > 1) {
-                spacing +=
-                    free_space /
-                    static_cast<float>(count - 1);
-            }
-            break;
-
-        case JustifyContent::SpaceAround:
-            if(count > 0) {
-                float extra =
-                    free_space /
-                    static_cast<float>(count);
-
-                spacing += extra;
-                start_offset = extra * 0.5f;
-            }
-            break;
-
-        case JustifyContent::SpaceEvenly:
-            if(count > 0) {
-                float extra =
-                    free_space /
-                    static_cast<float>(count + 1);
-
-                spacing += extra;
-                start_offset = extra;
-            }
-            break;
-
-        default:
-            break;
-    }
-
-    float cursor =
-        (
-            direction == FlexDirection::Row
-                ? inner.x
-                : inner.y
-        ) +
-        std::max(0.0f,start_offset);
-
-    for(auto& child : flow_children) {
-        AlignSelf alignment =
-            child.style->align_self;
-
-        AlignItems effective =
-            ui.style.align_items;
-
-        if(alignment != AlignSelf::Auto) {
-            effective = static_cast<AlignItems>(
-                static_cast<int>(alignment) - 1
-            );
-        }
-
-        if(direction == FlexDirection::Row) {
-            cursor +=
-                child.style->margin.left;
-
-            child.transform->x =
-                cursor;
-
-            float cross_available = std::max(
+            const bool cross_auto_before = cross_before_is_auto(child);
+            const bool cross_auto_after = cross_after_is_auto(child);
+            const bool cross_auto_margin = cross_auto_before || cross_auto_after;
+            const float fixed_cross_before = cross_before_margin(child);
+            const float fixed_cross_after = cross_after_margin(child);
+            const float cross_available = std::max(
                 0.0f,
-                inner.height -
-                    child.style->margin.top -
-                    child.style->margin.bottom
+                current.cross_size-fixed_cross_before-fixed_cross_after
             );
 
-            if(effective == AlignItems::Stretch) {
-                child.transform->height =
-                    cross_available;
+            // wrap-reverse reverses flex cross-start/cross-end. Physical
+            // margin-top/right/bottom/left remain physical margins.
+            if(wrap_reverse && !cross_auto_margin) {
+                if(effective == AlignItems::FlexStart) {
+                    effective = AlignItems::FlexEnd;
+                }
+                else if(effective == AlignItems::FlexEnd) {
+                    effective = AlignItems::FlexStart;
+                }
             }
 
-            if(effective == AlignItems::Center) {
-                child.transform->y =
-                    inner.y +
-                    child.style->margin.top +
-                    (
-                        cross_available -
-                        child.transform->height
-                    ) * 0.5f;
-            }
-            else if(effective == AlignItems::FlexEnd) {
-                child.transform->y =
-                    inner.y +
-                    inner.height -
-                    child.style->margin.bottom -
-                    child.transform->height;
+            const bool auto_main_before = main_before_is_auto(child);
+            const bool auto_main_after = main_after_is_auto(child);
+            const float used_main_before = auto_main_before
+                ? auto_main_margin
+                : main_before_margin(child);
+            const float used_main_after = auto_main_after
+                ? auto_main_margin
+                : main_after_margin(child);
+
+            cursor += used_main_before;
+
+            if(direction == FlexDirection::Row) {
+                child.transform->x = cursor;
+
+                // cross_available ultimately comes from this container's own box,
+                // which for an auto-height row is itself still unresolved at this
+                // point (its real height is what we're about to measure FROM these
+                // children). Stretching children into it first creates a circular
+                // auto-height-stretch feedback where the row inflates to whatever
+                // space its parent happened to offer, instead of sizing to the
+                // children's own natural height like a normal browser would.
+                if(
+                    effective == AlignItems::Stretch && !cross_auto_margin &&
+                    !ShouldAutoHeight(ui.style)
+                ) {
+                    child.transform->height = cross_available;
+                }
+
+                if(cross_auto_margin) {
+                    const float cross_free = std::max(
+                        0.0f,
+                        cross_available-child.transform->height
+                    );
+                    const int auto_count =
+                        static_cast<int>(cross_auto_before) +
+                        static_cast<int>(cross_auto_after);
+                    const float auto_share = auto_count>0
+                        ? cross_free/static_cast<float>(auto_count)
+                        : 0.0f;
+                    child.transform->y =
+                        line_cross_origin + fixed_cross_before +
+                        (cross_auto_before ? auto_share : 0.0f);
+                }
+                else if(effective == AlignItems::Center) {
+                    child.transform->y =
+                        line_cross_origin + fixed_cross_before +
+                        (cross_available-child.transform->height)*0.5f;
+                }
+                else if(effective == AlignItems::FlexEnd) {
+                    child.transform->y =
+                        line_cross_origin + current.cross_size -
+                        fixed_cross_after-child.transform->height;
+                }
+                else {
+                    child.transform->y =
+                        line_cross_origin + fixed_cross_before;
+                }
+
+                cursor +=
+                    child.transform->width + used_main_after + spacing;
             }
             else {
-                child.transform->y =
-                    inner.y +
-                    child.style->margin.top;
+                child.transform->y = cursor;
+
+                // Same reasoning as the Row branch above, mirrored onto the other
+                // axis: don't stretch a column's children into its own not-yet-
+                // resolved auto width.
+                if(
+                    effective == AlignItems::Stretch && !cross_auto_margin &&
+                    !ShouldAutoWidth(ui.style)
+                ) {
+                    child.transform->width = cross_available;
+                }
+
+                if(cross_auto_margin) {
+                    const float cross_free = std::max(
+                        0.0f,
+                        cross_available-child.transform->width
+                    );
+                    const int auto_count =
+                        static_cast<int>(cross_auto_before) +
+                        static_cast<int>(cross_auto_after);
+                    const float auto_share = auto_count>0
+                        ? cross_free/static_cast<float>(auto_count)
+                        : 0.0f;
+                    child.transform->x =
+                        line_cross_origin + fixed_cross_before +
+                        (cross_auto_before ? auto_share : 0.0f);
+                }
+                else if(effective == AlignItems::Center) {
+                    child.transform->x =
+                        line_cross_origin + fixed_cross_before +
+                        (cross_available-child.transform->width)*0.5f;
+                }
+                else if(effective == AlignItems::FlexEnd) {
+                    child.transform->x =
+                        line_cross_origin + current.cross_size -
+                        fixed_cross_after-child.transform->width;
+                }
+                else {
+                    child.transform->x =
+                        line_cross_origin + fixed_cross_before;
+                }
+
+                cursor +=
+                    child.transform->height + used_main_after + spacing;
             }
 
-            cursor +=
-                child.transform->width +
-                child.style->margin.right +
-                spacing;
+            apply_relative_position(child);
+            ApplyRuntimeSizeToElement(*child.rect,*child.style,inner);
+            ApplyRuntimePositionToElement(*child.rect,*child.style,inner);
+            if (child.style->transform_operations) {
+                EvaluateTransformMatrix(*child.style, *child.transform, inner.width, inner.height, child.style->font_size,CSS_UI_ROOT_FONT_SIZE, CSS_UI_VIEWPORT_WIDTH, CSS_UI_VIEWPORT_HEIGHT);
+            }
+            apply_scroll(child);
+
+            if(child.container != nullptr) {
+                LayoutContainerPass(
+                    *child.container,
+                    style_sheet,
+                    // See the comment on the first recursive LayoutContainerPass
+                    // call in this file: always recurse with the size this pass
+                    // already resolved for this child, not the parent's raw inner box.
+                    child.transform->width,
+                    child.transform->height,
+                    true
+                );
+            }
+            if(child.layout_nested) child.layout_nested();
+        }
+    };
+
+    if(flow_children.empty()) {
+        layout_absolute_children();
+        commit_layout_state();
+        return;
+    }
+
+    if(!wrapping) {
+        // Preserve the common no-wrap path without allocating a line vector.
+        // This keeps existing flex/container layout as cheap as before 0.7.1.
+        FlexLine single_line;
+        single_line.begin = 0;
+        for(std::size_t index=0; index<flow_children.size(); ++index) {
+            append_to_line(single_line,index);
+        }
+        // An auto-sized cross axis (auto-height row / auto-width column) has no
+        // definite size to align inside yet: `available_cross` is merely the
+        // space the parent offered. Align within the line's own content size
+        // (already accumulated by append_to_line) instead, or align-self /
+        // align-items: center|flex-end push children to the bottom of that
+        // offered space and inflate the container to match.
+        if(!cross_axis_is_auto) single_line.cross_size = available_cross;
+        layout_line(single_line);
+    }
+    else {
+        std::vector<FlexLine> lines;
+        // Worst case is one item per line. One reserve avoids growth/copies on
+        // wrapped toolbars and palettes with many children.
+        lines.reserve(flow_children.size());
+
+        FlexLine line;
+        line.begin = 0;
+        for(std::size_t index=0; index<flow_children.size(); ++index) {
+            LayoutChild& child = flow_children[index];
+            const float outer_main =
+                child_main_size(child) +
+                main_before_margin(child) +
+                main_after_margin(child);
+            const bool has_items = line.end>line.begin;
+            const float candidate_main =
+                line.base_main +
+                (has_items ? main_gap : 0.0f) +
+                outer_main;
+
+            if(
+                has_items &&
+                candidate_main > available_main + 0.01f
+            ) {
+                lines.push_back(line);
+                line = FlexLine{};
+                line.begin = index;
+            }
+            append_to_line(line,index);
+        }
+        if(line.end>line.begin) lines.push_back(line);
+
+        if(lines.size()==1) {
+            if(!cross_axis_is_auto) lines[0].cross_size = available_cross;
         }
         else {
-            cursor +=
-                child.style->margin.top;
+            float used_cross =
+                cross_gap*static_cast<float>(lines.size()-1);
+            for(const FlexLine& current : lines) used_cross += current.cross_size;
 
-            child.transform->y =
-                cursor;
+            float free_cross = std::max(0.0f,available_cross-used_cross);
+            const AlignContent alignment =
+                ui.style.align_content.value_or(AlignContent::Stretch);
+            float cross_start = 0.0f;
+            float line_spacing = cross_gap;
 
-            float cross_available = std::max(
-                0.0f,
-                inner.width -
-                    child.style->margin.left -
-                    child.style->margin.right
-            );
-
-            if(effective == AlignItems::Stretch) {
-                child.transform->width =
-                    cross_available;
+            switch(alignment) {
+                case AlignContent::Stretch:
+                    if(free_cross>0.0f) {
+                        const float addition =
+                            free_cross/static_cast<float>(lines.size());
+                        for(FlexLine& current : lines) current.cross_size += addition;
+                    }
+                    break;
+                case AlignContent::Center:
+                    cross_start = free_cross*0.5f;
+                    break;
+                case AlignContent::FlexEnd:
+                    cross_start = free_cross;
+                    break;
+                case AlignContent::SpaceBetween:
+                    if(lines.size()>1) {
+                        line_spacing +=
+                            free_cross/static_cast<float>(lines.size()-1);
+                    }
+                    break;
+                case AlignContent::SpaceAround: {
+                    const float extra =
+                        free_cross/static_cast<float>(lines.size());
+                    line_spacing += extra;
+                    cross_start = extra*0.5f;
+                    break;
+                }
+                case AlignContent::SpaceEvenly: {
+                    const float extra =
+                        free_cross/static_cast<float>(lines.size()+1);
+                    line_spacing += extra;
+                    cross_start = extra;
+                    break;
+                }
+                case AlignContent::FlexStart:
+                default:
+                    break;
             }
 
-            if(effective == AlignItems::Center) {
-                child.transform->x =
-                    inner.x +
-                    child.style->margin.left +
-                    (
-                        cross_available -
-                        child.transform->width
-                    ) * 0.5f;
+            float cross_cursor = cross_start;
+            for(FlexLine& current : lines) {
+                current.cross_offset = cross_cursor;
+                cross_cursor += current.cross_size+line_spacing;
             }
-            else if(effective == AlignItems::FlexEnd) {
-                child.transform->x =
-                    inner.x +
-                    inner.width -
-                    child.style->margin.right -
-                    child.transform->width;
-            }
-            else {
-                child.transform->x =
-                    inner.x +
-                    child.style->margin.left;
-            }
-
-            cursor +=
-                child.transform->height +
-                child.style->margin.bottom +
-                spacing;
         }
 
-        apply_relative_position(child);
-        ApplyRuntimeSizeToElement(*child.rect,*child.style,inner);
-        ApplyRuntimePositionToElement(*child.rect,*child.style,inner);
-        apply_scroll(child);
-
-        if(child.container != nullptr) {
-            LayoutContainerPass(
-                *child.container,
-                style_sheet,
-                ShouldAutoWidth(*child.style)
-                    ? inner.width
-                    : child.transform->width,
-                ShouldAutoHeight(*child.style)
-                    ? inner.height
-                    : child.transform->height,
-                true
-            );
-        }
-        if(child.layout_nested) child.layout_nested();
+        for(FlexLine& current : lines) layout_line(current);
     }
 
     layout_absolute_children();
@@ -1784,22 +2320,64 @@ void LayoutContainer(
     bool force_layout
 ) {
     if(CSS_UI_LAYOUT_DEPTH == 0) {
-        const bool pseudo_changed = RefreshUIPseudoStatesForLayout(ui);
-        const bool layout_animation_active = HasActiveUILayoutAnimations(ui);
-        force_layout = force_layout || pseudo_changed || layout_animation_active;
-        if(pseudo_changed) MarkLayoutDirty(ui,true);
+        const std::size_t previous_root_pseudo_hash =
+            ui.rect.last_layout_pseudo_hash;
 
-        ui.style = ResolveStyleWithPseudoStates(
-            style_sheet,SelectorType::Body,ui.style.id,
-            ui.rect.pseudo_states.ActiveNames(),ui.style
-        );
-        ResolveComputedLengths(
-            ui.style,
-            containing_width < 0.0f ? static_cast<float>(GetScreenWidth()) : containing_width,
-            containing_height < 0.0f ? static_cast<float>(GetScreenHeight()) : containing_height,
-            20.0f,ui.inherited_scale,true
-        );
-        ui.style = ResolveLayoutAnimatedStyle(ui.rect,style_sheet,std::move(ui.style));
+        UILayoutFrameActivity activity;
+        if(
+            style_sheet.uses_layout_pseudo_states ||
+            style_sheet.uses_layout_animations
+        ) {
+            activity = RefreshUILayoutFrameActivity(
+                ui,
+                style_sheet.uses_layout_pseudo_states,
+                style_sheet.uses_layout_animations
+            );
+        }
+
+        const bool root_pseudo_changed =
+            previous_root_pseudo_hash != ui.rect.last_layout_pseudo_hash;
+
+        force_layout = force_layout ||
+            activity.pseudo_changed || activity.animation_active;
+        if(activity.pseudo_changed) MarkLayoutDirty(ui,true);
+
+        const float resolved_width = containing_width < 0.0f
+            ? static_cast<float>(GetScreenWidth())
+            : containing_width;
+        const float resolved_height = containing_height < 0.0f
+            ? static_cast<float>(GetScreenHeight())
+            : containing_height;
+
+        const bool root_style_dirty =
+            force_layout ||
+            ui.layout_dirty ||
+            root_pseudo_changed ||
+            ui.last_layout_revision != style_sheet.revision ||
+            ui.last_containing_width != resolved_width ||
+            ui.last_containing_height != resolved_height;
+
+        if(root_style_dirty) {
+            ui.style.selector = SelectorType::Body;
+            ui.style.selector_ancestors.clear();
+            ui.style.selector_ancestor_previous_siblings.clear();
+            ui.style.selector_previous_siblings.reset();
+            ui.style = ResolveStyleWithPseudoStates(
+                style_sheet,SelectorType::Body,ui.style.id,
+                ui.rect.pseudo_states.ActiveNamesView(),ui.style
+            );
+            ResolveComputedLengths(
+                ui.style,
+                resolved_width,
+                resolved_height,
+                CSS_UI_ROOT_FONT_SIZE,ui.inherited_scale,true
+            );
+            ui.style = ResolveLayoutAnimatedStyle(
+                ui.rect,style_sheet,std::move(ui.style)
+            );
+            CSS_UI_ROOT_FONT_SIZE = ui.style.font_size;
+            ++ui.rect.style_generation;
+        }
     }
 
     if(CSS_UI_LAYOUT_DEPTH > 0) {
@@ -1835,4 +2413,3 @@ void LayoutContainer(
 
     CSS_UI_LAYOUT_DEPTH--;
 }
-

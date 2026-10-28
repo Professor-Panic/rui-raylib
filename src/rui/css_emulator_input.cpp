@@ -98,7 +98,7 @@ void UpdateInput(UIInput<bool>& input) {
     ResetInputFrameState(input);
 
     Rectangle rect = input.rect.transform;
-    input.hovered = CheckCollisionPointRec(GetMousePosition(),rect);
+    input.hovered = CheckCollisionPointRec(GetUIMousePosition(),rect);
     if(input.hovered) {
         CSS_UI_REQUESTED_CURSOR=(MOUSE_CURSOR_POINTING_HAND);
     }
@@ -154,7 +154,30 @@ Vector3 ColorToHSV01(Color color) {
         std::clamp(maximum,0.0f,1.0f)
     };
 }
-
+bool TryParseColorHex(const std::string& text, Color& out) {
+    std::string hex = text;
+    if(hex.empty()) return false;
+    if(hex[0] == '#') hex.erase(0,1);
+    if(hex.size() < 6 || hex.size() > 8) return false; // allow RRGGBB or RRGGBBAA
+    if(hex.size() == 6) hex += "FF"; // default alpha 255
+    if(hex.size() != 8) return false;
+    auto parse_component = [&](size_t pos) -> int {
+        int value = 0;
+        for(int i=0;i<2;i++) {
+            char c = hex[pos+i];
+            value *= 16;
+            if(c >= '0' && c <= '9') value += c - '0';
+            else if(c >= 'a' && c <= 'f') value += c - 'a' + 10;
+            else if(c >= 'A' && c <= 'F') value += c - 'A' + 10;
+            else return -1;
+        }
+        return value;
+    };
+    int r = parse_component(0), g = parse_component(2), b = parse_component(4), a = parse_component(6);
+    if(r < 0 || g < 0 || b < 0 || a < 0) return false;
+    out = { (unsigned char)r, (unsigned char)g, (unsigned char)b, (unsigned char)a };
+    return true;
+}
 Color ColorFromHSV01(
     float hue,
     float saturation,
@@ -233,21 +256,21 @@ UIColorPickerGeometry GetColorPickerGeometry(
         popup_height
     };
 
-    if(popup.x+popup.width > float(GetScreenWidth())-4.0f) {
-        popup.x =
-            std::max(
-                4.0f,
-                static_cast<float>(GetScreenWidth())-popup.width-4.0f);
+    const Rectangle visible=CurrentUIVisibleLogicalScreenRect();
+    const float visible_right=visible.x+visible.width;
+    const float visible_bottom=visible.y+visible.height;
+    if(popup.x+popup.width > visible_right-4.0f) {
+        popup.x=std::max(visible.x+4.0f,visible_right-popup.width-4.0f);
     }
 
-    if(popup.y+popup.height > float(GetScreenHeight())-4.0f) {
+    if(popup.y+popup.height > visible_bottom-4.0f) {
         popup.y =
             input.rect.transform.y-
             popup.height-
             6.0f * scale;
     }
 
-    popup.y = std::max(4.0f,popup.y);
+    popup.y=std::max(visible.y+4.0f,popup.y);
 
     Rectangle saturation_value = {
         popup.x+padding,
@@ -322,6 +345,29 @@ const unsigned char* GetColorComponent(
     );
 }
 
+bool CommitColorDragTextEdit(UIInput<Color>& input) {
+    if(input.active_component < 0 || input.active_component >= 4) return false;
+
+    std::string& buffer = input.component_buffers[input.active_component];
+    if(buffer.empty()) return false;
+
+    unsigned char* component = GetColorComponent(input.value,input.active_component);
+    if(component == nullptr) return false;
+
+    const unsigned char old_value = *component;
+    try {
+        const int next = std::clamp(std::stoi(buffer),0,255);
+        *component = static_cast<unsigned char>(next);
+    }
+    catch(...) {
+        return false;
+    }
+
+    const bool changed = *component != old_value;
+    input.changed = input.changed || changed;
+    return changed;
+}
+
 void UpdateInput(UIInput<Color>& input) {
     if(UpdateTriggerInput(input)) {
         return;
@@ -330,7 +376,7 @@ void UpdateInput(UIInput<Color>& input) {
     ResetInputFrameState(input);
 
     Rectangle rect = input.rect.transform;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetUIMousePosition();
 
     input.hovered =
         CheckCollisionPointRec(mouse,rect);
@@ -374,36 +420,121 @@ void UpdateInput(UIInput<Color>& input) {
             );
 
             CSS_UI_REQUESTED_CURSOR =
-                MOUSE_CURSOR_RESIZE_EW;
+                input.drag_text_editing &&
+                input.active_component == hovered_component
+                    ? MOUSE_CURSOR_IBEAM
+                    : MOUSE_CURSOR_RESIZE_EW;
         }
 
         if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-            input.focused =
-                hovered_component >= 0;
+            const int previous_component = input.active_component;
+            const bool was_drag_text_editing = input.drag_text_editing;
+            const bool drag_double_click =
+                hovered_component >= 0 &&
+                RegisterDragInputClick(input,mouse,hovered_component);
+
+            if(
+                was_drag_text_editing &&
+                (hovered_component < 0 || hovered_component != previous_component)
+            ) {
+                CommitColorDragTextEdit(input);
+                input.drag_text_editing = false;
+                input.drag_text_select_all = false;
+            }
+
+            input.focused = hovered_component >= 0;
+            input.dragging = false;
 
             if(input.focused) {
-                input.active_component =
-                    hovered_component;
+                input.active_component = hovered_component;
+                const unsigned char* component =
+                    GetColorComponent(input.value,input.active_component);
+                if(
+                    component != nullptr &&
+                    !(
+                        was_drag_text_editing &&
+                        hovered_component == previous_component
+                    )
+                ) {
+                    input.component_buffers[input.active_component] =
+                        TextFormat("%d",static_cast<int>(*component));
+                }
 
-                input.dragging = true;
-                input.drag_start_value =
-                    input.value;
-                input.drag_accumulator =
-                    0.0f;
+                if(drag_double_click) {
+                    input.drag_text_editing = true;
+                    UIInputSelectAllText(
+                        input,
+                        input.component_buffers[input.active_component]
+                    );
+                    input.dragging = false;
+                    input.caret_frame_counter = 0;
+                }
+                else if(!input.drag_text_editing) {
+                    input.dragging = true;
+                    input.drag_start_value = input.value;
+                    input.drag_accumulator = 0.0f;
+                }
+
+                if(!drag_double_click && input.drag_text_editing) {
+                    Rectangle component_rect = {
+                        content.x + component_width*static_cast<float>(input.active_component),
+                        content.y,
+                        component_width,
+                        content.height
+                    };
+                    const bool extend =
+                        IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                    UIInputSetCaretFromMouse(
+                        input,
+                        input.component_buffers[input.active_component],
+                        component_rect,
+                        input.style,
+                        mouse.x,
+                        extend
+                    );
+                    input.text_mouse_selecting = true;
+                }
             }
             else {
                 input.active_component = -1;
-                input.dragging = false;
+                input.drag_text_editing = false;
+                input.drag_text_select_all = false;
+                input.last_drag_click_time = -1.0;
             }
         }
 
         if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             input.dragging = false;
+            input.text_mouse_selecting = false;
+        }
+
+        if(
+            input.text_mouse_selecting &&
+            IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+            input.drag_text_editing &&
+            input.focused &&
+            input.active_component >= 0
+        ) {
+            Rectangle component_rect = {
+                content.x + component_width*static_cast<float>(input.active_component),
+                content.y,
+                component_width,
+                content.height
+            };
+            UIInputSetCaretFromMouse(
+                input,
+                input.component_buffers[input.active_component],
+                component_rect,
+                input.style,
+                mouse.x,
+                true
+            );
         }
 
         input.active = input.dragging;
 
         if(
+            !input.drag_text_editing &&
             input.dragging &&
             input.active_component >= 0
         ) {
@@ -429,7 +560,7 @@ void UpdateInput(UIInput<Color>& input) {
                 );
 
             input.drag_accumulator +=
-                GetMouseDelta().x *
+                GetUIMouseDelta().x *
                 speed *
                 modifier;
 
@@ -470,6 +601,7 @@ void UpdateInput(UIInput<Color>& input) {
         if(
             input.hovered &&
             !input.dragging &&
+            !input.drag_text_editing &&
             hovered_component >= 0
         ) {
             const float wheel =
@@ -499,7 +631,62 @@ void UpdateInput(UIInput<Color>& input) {
             }
         }
 
+        if(
+            input.drag_text_editing &&
+            input.focused &&
+            input.active_component >= 0
+        ) {
+            std::string& buffer =
+                input.component_buffers[input.active_component];
+            input.caret_frame_counter++;
+            UIInputHandleTextNavigation(input,buffer);
+
+            int character = GetCharPressed();
+            while(character > 0) {
+                if(
+                    character >= '0' &&
+                    character <= '9' &&
+                    (UIInputHasTextSelection(input) || buffer.size() < input.max_characters)
+                ) {
+                    UIInputInsertTextCharacter(input,buffer,static_cast<char>(character));
+                }
+                character = GetCharPressed();
+            }
+
+            if(IsKeyPressed(KEY_BACKSPACE)) {
+                UIInputBackspaceText(input,buffer);
+            }
+
+            if(IsKeyPressed(KEY_DELETE)) {
+                UIInputDeleteText(input,buffer);
+            }
+
+            if(IsKeyPressed(KEY_ENTER)) {
+                CommitColorDragTextEdit(input);
+                input.submitted = true;
+                input.focused = false;
+                input.drag_text_editing = false;
+                input.drag_text_select_all = false;
+                input.text_mouse_selecting = false;
+                UIInputCollapseTextSelection(input,0);
+                input.last_drag_click_time = -1.0;
+                input.active_component = -1;
+                buffer.clear();
+            }
+            else if(IsKeyPressed(KEY_ESCAPE)) {
+                input.focused = false;
+                input.drag_text_editing = false;
+                input.drag_text_select_all = false;
+                input.text_mouse_selecting = false;
+                UIInputCollapseTextSelection(input,0);
+                input.last_drag_click_time = -1.0;
+                input.active_component = -1;
+                buffer.clear();
+            }
+        }
+
         input.changed =
+            input.changed ||
             input.value.r != previous.r ||
             input.value.g != previous.g ||
             input.value.b != previous.b ||
@@ -604,8 +791,98 @@ void UpdateInput(UIInput<Color>& input) {
     }
 
     if(!input.picker_open) {
+        // Popup closed – reset embedded hex editor state.
+        if(input.hex_input) {
+            input.hex_input->focused = false;
+            input.hex_input->edit_buffer.clear();
+            input.hex_input->text_mouse_selecting = false;
+            UIInputCollapseTextSelection(*input.hex_input, 0);
+        }
         input.active = false;
         return;
+    }
+
+    // ----- Embedded hex color editor -----
+    {
+        if(!input.hex_input) {
+            input.hex_input = std::make_unique<UIInput<std::string>>();
+            input.hex_input->style = input.style;
+            input.hex_input->max_characters = 9;      // "#RRGGBBAA"
+            input.hex_input->placeholder = "#RRGGBBAA";
+            input.hex_input->show_value_box = false;
+            input.hex_input->style.text_align = TextAlign::Left;
+        }
+
+        // Position: where the static hex text was previously drawn.
+        const float hex_x = geometry.preview.x + geometry.preview.width + 12.0f;
+
+        // Size the box to fit "#RRGGBBAA" in the resolved font/size,
+        // plus padding — rather than stretching to fill the popup.
+        const Font hex_font = ResolveUIFont(input.hex_input->style.font);
+        const float hex_font_size = input.hex_input->style.font_size;   // verify this matches your ComputedStyle field name
+        const float hex_char_spacing = 1.0f;                            // match spacing used elsewhere by DrawTextEx
+
+        const Vector2 hex_text_size = MeasureTextEx(
+            hex_font,
+            "#RRGGBBAA",
+            hex_font_size,
+            hex_char_spacing
+        );
+
+        const float hex_padding = 16.0f;   // 8px each side — tune to taste
+
+        const float hex_available_width = std::max(
+            0.0f,
+            geometry.popup.x + geometry.popup.width - hex_x - 12.0f
+        );
+
+        const float hex_width = std::min(
+            hex_text_size.x + hex_padding,
+            hex_available_width
+        );
+
+        Rectangle hex_rect = {
+            hex_x,
+            geometry.preview.y,
+            hex_width,
+            geometry.preview.height
+        };
+
+        input.hex_input->rect.transform = hex_rect;
+
+        // Sync display value when not actively editing.
+        if(!input.hex_input->focused) {
+            input.hex_input->value = FormatColorHex(input.value);
+            input.hex_input->edit_buffer.clear();
+        }
+
+        input.hex_input_was_focused = input.hex_input->focused;
+
+        // Process the embedded input (mouse, keyboard, caret, selection).
+        UpdateInput(*input.hex_input);
+
+        const bool focus_lost = input.hex_input_was_focused && !input.hex_input->focused;
+        const bool should_commit = input.hex_input->submitted || focus_lost;
+
+        if(should_commit) {
+            Color parsed;
+            if(TryParseColorHex(input.hex_input->value, parsed)) {
+                input.value = parsed;
+                input.changed = true;
+
+                // Keep the picker's HSV state in sync.
+                Vector3 hsv = ColorToHSV01(parsed);
+                input.picker_hue = hsv.x;
+                input.picker_saturation = hsv.y;
+                input.picker_brightness = hsv.z;
+            }
+            input.hex_input->submitted = false;
+        }
+
+        // If the field lost focus or we just committed, resync display.
+        if(!input.hex_input->focused) {
+            input.hex_input->value = FormatColorHex(input.value);
+        }
     }
 
     if(
@@ -714,7 +991,6 @@ void UpdateInput(UIInput<Color>& input) {
         input.value.b != previous.b ||
         input.value.a != previous.a;
 }
-
 void UpdateInput(UIInput<std::string>& input) {
     if(UpdateTriggerInput(input)) {
         return;
@@ -723,35 +999,96 @@ void UpdateInput(UIInput<std::string>& input) {
     ResetInputFrameState(input);
 
     Rectangle rect = input.rect.transform;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetUIMousePosition();
 
     input.hovered =CheckCollisionPointRec(mouse,rect);
 
-    if(input.hovered && input.focused) {
+    if(input.hovered) {
         CSS_UI_REQUESTED_CURSOR=(MOUSE_CURSOR_IBEAM);
     }
 
+    // Focus can already have been granted before this function runs (pointer
+    // focus on press, Tab navigation), in which case the false->true edge is
+    // never seen here and the edit buffer would stay empty. A focused field
+    // whose buffer was never filled counts as "just focused".
+    bool just_focused = false;
+    if(input.focused && input.edit_buffer.empty() && !input.value.empty()) {
+        input.edit_buffer = input.value;
+        UIInputSelectAllText(input,input.edit_buffer);
+        input.caret_frame_counter = 0;
+        just_focused = true;
+    }
+
     if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        bool was_focused = input.focused;
+        bool was_focused = input.focused && !just_focused;
         input.focused = input.hovered;
         if(input.focused && !was_focused) {
+            // First click: select everything. The caret is placed by the next click.
             input.edit_buffer = input.value;
+            UIInputSelectAllText(input,input.edit_buffer);
             input.caret_frame_counter = 0;
+            just_focused = true;
+        }
+
+        if(input.focused && !just_focused) {
+            Rectangle text_rect = input.rect.transform;
+            text_rect.x += input.style.padding.left;
+            text_rect.y += input.style.padding.top;
+            text_rect.width = std::max(
+                0.0f,
+                text_rect.width-input.style.padding.left-input.style.padding.right
+            );
+            text_rect.height = std::max(
+                0.0f,
+                text_rect.height-input.style.padding.top-input.style.padding.bottom
+            );
+            const bool extend = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            UIInputSetCaretFromMouse(
+                input,input.edit_buffer,text_rect,input.style,mouse.x,extend
+            );
+            input.text_mouse_selecting = true;
         }
 
         if(was_focused && !input.focused) {
             input.value = input.edit_buffer;
             input.edit_buffer.clear();
+            input.text_mouse_selecting = false;
+            UIInputCollapseTextSelection(input,0);
         }
+    }
+
+    if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        input.text_mouse_selecting = false;
+    }
+
+    if(input.text_mouse_selecting && IsMouseButtonDown(MOUSE_BUTTON_LEFT) && input.focused) {
+        Rectangle text_rect = input.rect.transform;
+        text_rect.x += input.style.padding.left;
+        text_rect.y += input.style.padding.top;
+        text_rect.width = std::max(
+            0.0f,
+            text_rect.width-input.style.padding.left-input.style.padding.right
+        );
+        text_rect.height = std::max(
+            0.0f,
+            text_rect.height-input.style.padding.top-input.style.padding.bottom
+        );
+        UIInputSetCaretFromMouse(
+            input,input.edit_buffer,text_rect,input.style,mouse.x,true
+        );
     }
 
     input.active = input.focused;
 
     if(!input.focused) {
+        // Focus can be taken away elsewhere (pointer focus, Tab). Drop the stale
+        // buffer so the next focus re-reads the current value.
+        input.edit_buffer.clear();
         return;
     }
 
     input.caret_frame_counter++;
+    UIInputHandleTextNavigation(input,input.edit_buffer);
 
     int character = GetCharPressed();
 
@@ -759,40 +1096,62 @@ void UpdateInput(UIInput<std::string>& input) {
         if(
             character >= 32 &&
             character <= 125 &&
-            input.edit_buffer.size() <
-                input.max_characters
+            (UIInputHasTextSelection(input) || input.edit_buffer.size() < input.max_characters)
         ) {
-            input.edit_buffer.push_back(
-                static_cast<char>(character)
-            );
+            UIInputInsertTextCharacter(input,input.edit_buffer,static_cast<char>(character));
             input.value = input.edit_buffer;
             input.changed = true;
-            input.caret_frame_counter = 0;
         }
 
         character = GetCharPressed();
     }
 
-    if(
-        (IsKeyPressed(KEY_BACKSPACE)&&IsKeyDown(KEY_BACKSPACE)) &&
-        !input.edit_buffer.empty()
-    ) {
-        input.edit_buffer.pop_back();
-        input.value = input.edit_buffer;
-        input.changed = true;
-        input.caret_frame_counter = 0;
+    if(IsKeyPressed(KEY_BACKSPACE)) {
+        const std::string before = input.edit_buffer;
+        UIInputBackspaceText(input,input.edit_buffer);
+        if(input.edit_buffer != before) {
+            input.value = input.edit_buffer;
+            input.changed = true;
+        }
+    }
+
+    if(IsKeyPressed(KEY_DELETE)) {
+        const std::string before = input.edit_buffer;
+        UIInputDeleteText(input,input.edit_buffer);
+        if(input.edit_buffer != before) {
+            input.value = input.edit_buffer;
+            input.changed = true;
+        }
+    }
+    if(IsKeyPressed(KEY_TAB)) {
+        input.focused = false;
+        input.text_mouse_selecting = false;
+        input.edit_buffer.clear();
+        UIInputCollapseTextSelection(input,0);
+    }
+    if(IsKeyDown(KEY_LEFT_CONTROL)||IsKeyDown(KEY_RIGHT_CONTROL)) {
+        if(IsKeyPressed(KEY_C)) {
+            UIInputCopyTextSelection(input,input.edit_buffer);
+        }
+        if(IsKeyPressed(KEY_V)) {
+            UIInputPasteText(input,input.edit_buffer);
+        }
     }
 
     if(IsKeyPressed(KEY_ENTER)) {
         input.value = input.edit_buffer;
         input.submitted = true;
         input.focused = false;
+        input.text_mouse_selecting = false;
         input.edit_buffer.clear();
+        UIInputCollapseTextSelection(input,0);
     }
 
     if(IsKeyPressed(KEY_ESCAPE)) {
         input.focused = false;
+        input.text_mouse_selecting = false;
         input.edit_buffer.clear();
+        UIInputCollapseTextSelection(input,0);
     }
 }
 
@@ -806,7 +1165,7 @@ void UpdateSelectable(UISelectable& selectable) {
     }
 
     selectable.hovered = CheckCollisionPointRec(
-        GetMousePosition(),
+        GetUIMousePosition(),
         selectable.rect.transform
     );
     if(selectable.hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -851,6 +1210,7 @@ Rectangle ComboPopupRectangle(const UIComboBox& combo) {
 void UpdateComboBox(UIComboBox& combo) {
     combo.changed = false;
     combo.hovered_index = -1;
+
     if(combo.disabled) {
         combo.hovered = false;
         combo.active = false;
@@ -859,68 +1219,149 @@ void UpdateComboBox(UIComboBox& combo) {
         return;
     }
 
-    const Vector2 mouse = GetMousePosition();
-    combo.hovered = CheckCollisionPointRec(mouse,combo.rect.transform);
+    if(combo.items.empty()) {
+        combo.selected_index = -1;
+    }
+    else {
+        combo.selected_index = std::clamp(
+            combo.selected_index,
+            -1,
+            static_cast<int>(combo.items.size())-1
+        );
+    }
 
+    const Vector2 mouse = GetUIMousePosition();
+    combo.hovered = CheckCollisionPointRec(mouse,combo.rect.transform);
+    const bool was_open = combo.open;
+    bool opened_this_frame = false;
+
+    // Mouse activation is press-armed/release-committed. Consume both halves of
+    // the click so opening/closing a ComboBox cannot also activate a sibling,
+    // parent header, dock splitter, or control behind the overlay.
     if(combo.hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         combo.pressed_inside = true;
         combo.active = true;
         combo.focused = true;
+        CSS_UI_POINTER_INPUT_CONSUMED = true;
     }
+
     if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        if(combo.pressed_inside && combo.hovered) combo.open = !combo.open;
+        if(combo.pressed_inside) {
+            CSS_UI_POINTER_INPUT_CONSUMED = true;
+            if(combo.hovered) {
+                if(combo.open) {
+                    combo.open = false;
+                }
+                else {
+                    combo.open = true;
+                    opened_this_frame = true;
+                }
+            }
+        }
         combo.pressed_inside = false;
         combo.active = false;
     }
 
+    // Keyboard ownership is handled before the closed fast-path. The old order
+    // returned early here, which meant Enter/Space could close an open combo but
+    // could not reliably open a closed one.
+    if(combo.focused && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) {
+        combo.open = !combo.open;
+        opened_this_frame = combo.open;
+        combo.pressed_inside = false;
+        combo.active = false;
+    }
+
+    if(combo.open && IsKeyPressed(KEY_ESCAPE)) {
+        combo.open = false;
+        combo.pressed_inside = false;
+        combo.active = false;
+        return;
+    }
+
+    if(combo.focused && !combo.items.empty()) {
+        int next = combo.selected_index;
+        bool navigated = false;
+        if(IsKeyPressed(KEY_DOWN)) {
+            next = combo.selected_index < 0
+                ? 0
+                : std::min(combo.selected_index+1,static_cast<int>(combo.items.size())-1);
+            navigated = true;
+        }
+        if(IsKeyPressed(KEY_UP)) {
+            next = combo.selected_index < 0
+                ? 0
+                : std::max(0,combo.selected_index-1);
+            navigated = true;
+        }
+        if(navigated && next != combo.selected_index) {
+            combo.selected_index = next;
+            combo.changed = true;
+        }
+    }
+
     if(!combo.open) return;
+
     Rectangle popup = ComboPopupRectangle(combo);
     const float content_height = combo.style.item_height *
         static_cast<float>(combo.items.size());
     const float max_scroll = std::max(0.0f,content_height-popup.height);
+    combo.scroll_offset = std::clamp(combo.scroll_offset,0.0f,max_scroll);
+
+    // The click that opened the popup belongs to the owner control. Never reuse
+    // it as a popup/outside click in the same update. This is especially
+    // important for ComboBoxes inside rebuilt event cards/collapsibles.
+    if(opened_this_frame) return;
 
     if(CheckCollisionPointRec(mouse,popup)) {
+        const float popup_wheel = GetMouseWheelMove();
+        if(
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+            IsMouseButtonReleased(MOUSE_BUTTON_LEFT) ||
+            popup_wheel != 0.0f
+        ) {
+            CSS_UI_POINTER_INPUT_CONSUMED = true;
+        }
+
         combo.scroll_offset = std::clamp(
-            combo.scroll_offset - GetMouseWheelMove()*combo.style.scroll_speed,
+            combo.scroll_offset - popup_wheel*combo.style.scroll_speed,
             0.0f,
             max_scroll
         );
+
         const float local_y = mouse.y-popup.y+combo.scroll_offset;
         const int index = static_cast<int>(local_y/combo.style.item_height);
         if(index >= 0 && index < static_cast<int>(combo.items.size())) {
             combo.hovered_index = index;
             if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-                combo.selected_index = index;
-                combo.changed = true;
+                CSS_UI_POINTER_INPUT_CONSUMED = true;
+                if(combo.selected_index != index) {
+                    combo.selected_index = index;
+                    combo.changed = true;
+                }
                 combo.open = false;
+                combo.pressed_inside = false;
+                combo.active = false;
             }
         }
     }
     else if(
+        was_open &&
         IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
         !combo.hovered
     ) {
+        // Outside click dismisses the overlay and is fully consumed. It must not
+        // become a click on whatever sits behind the popup.
+        CSS_UI_POINTER_INPUT_CONSUMED = true;
         combo.open = false;
-    }
-
-    if(IsKeyPressed(KEY_ESCAPE)) combo.open = false;
-    if(combo.focused && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))) {
-        combo.open = !combo.open;
-    }
-    if(combo.focused && !combo.items.empty()) {
-        int next = combo.selected_index;
-        if(IsKeyPressed(KEY_DOWN)) next = std::min(next+1,static_cast<int>(combo.items.size())-1);
-        if(IsKeyPressed(KEY_UP)) next = std::max(0,next-1);
-        if(next != combo.selected_index) {
-            combo.selected_index = next;
-            combo.changed = true;
-        }
+        combo.pressed_inside = false;
+        combo.active = false;
     }
 }
 
 void UpdateCanvas(UICanvas& canvas) {
-    const Vector2 mouse = GetMousePosition();
-    const Vector2 mouse_delta = GetMouseDelta();
+    const Vector2 mouse = GetUIMousePosition();
+    const Vector2 mouse_delta = GetUIMouseDelta();
     canvas.hovered = CheckCollisionPointRec(mouse,canvas.rect.transform);
     canvas.local_mouse = {
         mouse.x-canvas.rect.transform.x,
@@ -991,8 +1432,11 @@ void UpdateImage(UIImage& image) {
     image.clicked = false;
     image.pressed = false;
     image.released = false;
-    image.hovered = CheckCollisionPointRec(GetMousePosition(),image.rect.transform);
-    if(!image.interactive || image.disabled || image.rect.inherited_disabled) return;
+    if(!image.interactive || image.disabled || image.rect.inherited_disabled) {
+        image.hovered = false;
+        return;
+    }
+    image.hovered = CheckCollisionPointRec(GetUIMousePosition(),image.rect.transform);
     image.pressed = image.hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     image.released = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
     if(image.pressed) image.focused = true;
@@ -1021,27 +1465,24 @@ void UpdateSplitter(
     splitter.delta = 0.0f;
     const bool disabled = splitter.disabled || splitter.rect.inherited_disabled;
     splitter.hovered = !disabled && CheckCollisionPointRec(
-        GetMousePosition(),splitter.rect.transform
+        GetUIMousePosition(),splitter.rect.transform
     );
     if(index == 0 || index+1 >= parent.elements.size()) {
         splitter.dragging = false;
         return;
     }
-
     UIElementLayoutRef before = GetUIElementLayoutRef(parent.elements[index-1]);
     UIElementLayoutRef after = GetUIElementLayoutRef(parent.elements[index+1]);
     if(before.rect == nullptr || after.rect == nullptr) {
         splitter.dragging = false;
         return;
     }
-
     UISplitterOrientation orientation = splitter.orientation;
     if(orientation == UISplitterOrientation::Auto) {
         orientation = parent.direction == LayoutDirection::Row
             ? UISplitterOrientation::Vertical
             : UISplitterOrientation::Horizontal;
     }
-
     if(splitter.hovered || splitter.dragging) {
         CSS_UI_REQUESTED_CURSOR=(
             orientation == UISplitterOrientation::Vertical
@@ -1049,10 +1490,9 @@ void UpdateSplitter(
                 : MOUSE_CURSOR_RESIZE_NS
         );
     }
-
     if(splitter.hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         splitter.dragging = true;
-        splitter.drag_origin = GetMousePosition();
+        splitter.drag_origin = GetUIMousePosition();
         splitter.before_start_size = {
             before.rect->transform.width,before.rect->transform.height
         };
@@ -1062,7 +1502,7 @@ void UpdateSplitter(
     }
 
     if(splitter.dragging && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-        const Vector2 mouse = GetMousePosition();
+        const Vector2 mouse = GetUIMousePosition();
         float delta = orientation == UISplitterOrientation::Vertical
             ? mouse.x-splitter.drag_origin.x
             : mouse.y-splitter.drag_origin.y;
@@ -1151,7 +1591,7 @@ void UpdateButton(UIButton& button) {
 
     bool was_hovered = button.hovered;
 
-    button.hovered = CheckCollisionPointRec(GetMousePosition(),hit_rect);
+    button.hovered = CheckCollisionPointRec(GetUIMousePosition(),hit_rect);
     button.hover_entered =!was_hovered && button.hovered;
     button.hover_exited =was_hovered && !button.hovered;
     if(button.hovered){
@@ -1178,4 +1618,3 @@ void UpdateButton(UIButton& button) {
         button.released = true;
     }
 }
-

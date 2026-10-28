@@ -2,7 +2,7 @@
 
 #include "raylib.h"
 #include "raymath.h"
-
+#include "rlgl.h"
 #include <algorithm>
 #include <any>
 #include <array>
@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <cfloat>
 #include <deque>
 #include <functional>
 #include <initializer_list>
@@ -57,6 +58,8 @@ enum class SelectorType {
     Table,
     VirtualList,
     DockSpace,
+    Viewport,
+    ViewportItem,
     Tooltip
 };
 
@@ -111,6 +114,8 @@ public:
         std::function<void(bool&)> update
     );
     bool Set(const std::string& name, bool value);
+    // Fast path for normalized engine-owned names such as hover/open/active.
+    bool SetKnown(std::string_view normalized_name, bool value);
     bool Toggle(const std::string& name);
     bool Remove(const std::string& name);
     bool Active(const std::string& name) const;
@@ -119,10 +124,17 @@ public:
     void Update();
     void SyncBuiltIn(const std::string& name, bool engine_value);
     std::vector<std::string> ActiveNames() const;
+    const std::vector<std::string>& ActiveNamesView() const;
     std::size_t ActiveHash() const;
 
 private:
+    void InvalidateActiveCache();
+    void RebuildActiveCache() const;
+
     std::unordered_map<std::string,UIPseudoState> states_;
+    mutable bool active_cache_dirty_ = true;
+    mutable std::vector<std::string> active_names_cache_;
+    mutable std::size_t active_hash_cache_ = 0;
 };
 
 enum class UIEasing {
@@ -161,6 +173,12 @@ enum class FlexDirection {
     Column
 };
 
+enum class FlexWrap {
+    NoWrap,
+    Wrap,
+    WrapReverse
+};
+
 enum class JustifyContent {
     FlexStart,
     Center,
@@ -185,6 +203,28 @@ enum class AlignSelf {
     FlexEnd
 };
 
+enum class AlignContent {
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly
+};
+
+enum class JustifySelf {
+    Auto,
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd
+};
+enum class PerspectiveType{
+    None,
+    Inherit,
+    Initial
+};
 enum class GridAutoFlow {
     Row,
     Column
@@ -195,12 +235,28 @@ enum class UIImageFit {
     Contain,
     Cover,
     Center,
-    Tile
+    Tile,
+    TileX,
+    TileY
 };
 
 enum class UIImageSampling {
     Nearest,
     Bilinear
+};
+
+enum class UIImageSliceMode {
+    Stretch,
+    Tile
+};
+
+enum class UIImageBlendMode {
+    Alpha,
+    Additive,
+    Multiplied,
+    AddColors,
+    SubtractColors,
+    AlphaPremultiply
 };
 
 enum class UISplitterOrientation {
@@ -222,12 +278,97 @@ enum class OverflowType {
     Scroll
 };
 
+// RCSS border stroke mode. Solid is the compatibility default.
+enum class UIBorderStyle {
+    None,
+    Solid,
+    Dashed,
+    Dotted,
+    Double
+};
+
+// Typed RCSS expression/value infrastructure. Literal lengths stay allocation-free;
+// only calc()/min()/max()/clamp()/var() values allocate an immutable AST.
+enum class UIStyleValueDimension {
+    Number,
+    Length,
+    Angle,
+    Time
+};
+
+enum class UIStyleUnit {
+    Number,
+    Pixels,
+    Percent,
+    ViewWidth,
+    ViewHeight,
+    Em,
+    RootEm,
+    Degrees,
+    Seconds,
+    Milliseconds
+};
+
+enum class UIStyleExpressionKind {
+    Literal,
+    Variable,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Negate,
+    Minimum,
+    Maximum,
+    Clamp
+};
+
+struct UIStyleExpressionNode;
+using UIStyleExpression = std::shared_ptr<const UIStyleExpressionNode>;
+using UIStyleVariableMap = std::unordered_map<std::string,std::string>;
+
+struct UIStyleExpressionNode {
+    UIStyleExpressionKind kind = UIStyleExpressionKind::Literal;
+    float literal = 0.0f;
+    UIStyleUnit unit = UIStyleUnit::Number;
+    std::string variable;
+    std::string fallback;
+    std::vector<UIStyleExpression> arguments;
+};
+
+struct UIStyleEvaluationContext {
+    float percent_reference = 0.0f;
+    float viewport_width = 0.0f;
+    float viewport_height = 0.0f;
+    float font_size = 16.0f;
+    float root_font_size = 16.0f;
+    const UIStyleVariableMap* variables = nullptr;
+};
+
+struct UIEvaluatedStyleValue {
+    float value = 0.0f;
+    UIStyleValueDimension dimension = UIStyleValueDimension::Number;
+};
+
+UIStyleExpression ParseUIStyleExpression(
+    const std::string& source,
+    std::string* error = nullptr
+);
+
+std::optional<UIEvaluatedStyleValue> EvaluateUIStyleExpression(
+    const UIStyleExpression& expression,
+    const UIStyleEvaluationContext& context,
+    std::string* error = nullptr
+);
+
 enum class LengthUnit {
     Auto,
     Pixels,
     Percent,
     ViewWidth,
-    ViewHeight
+    ViewHeight,
+    Em,
+    RootEm,
+    Expression
 };
 enum class InputStepButtonLayout {
     Front,      // Both buttons after the value area:  [-][+]
@@ -238,6 +379,113 @@ enum class InputStepButtonLayout {
 struct CSSLength {
     float value = 0.0f;
     LengthUnit unit = LengthUnit::Pixels;
+    // Kept for diagnostics/source compatibility. expression_ast is parsed once
+    // at stylesheet compilation and evaluated cheaply during layout.
+    std::string expression;
+    UIStyleExpression expression_ast;
+};
+
+struct UIDeferredCSSValue {
+    std::string raw;
+};
+
+struct UIGeneratedContentValue {
+    std::string text;
+    bool enabled = true;
+};
+
+enum class UIGeneratedPseudoKind {
+    None,
+    Before,
+    After
+};
+
+enum class UIFilterType {
+    Blur,
+    Brightness,
+    Contrast,
+    Saturate,
+    Grayscale,
+    Opacity,
+    HueRotate
+};
+
+struct UIFilterOperation {
+    UIFilterType type = UIFilterType::Opacity;
+    UIStyleExpression value;
+    std::string source;
+};
+
+struct UIFilterList {
+    std::vector<UIFilterOperation> operations;
+};
+using UIFilterListRef = std::shared_ptr<const UIFilterList>;
+
+struct UIShaderEffect {
+    std::string path;
+};
+struct UIShaderEffectList {
+    std::vector<UIShaderEffect> effects;
+};
+using UIShaderEffectListRef = std::shared_ptr<const UIShaderEffectList>;
+
+struct UIShaderUniformBinding {
+    std::string name;
+    std::string raw_value;
+};
+using UIShaderUniformList = std::vector<UIShaderUniformBinding>;
+using UIShaderUniformListRef = std::shared_ptr<const UIShaderUniformList>;
+
+enum class UIMixBlendMode {
+    Normal,
+    Alpha,
+    Additive,
+    Multiply,
+    AddColors,
+    SubtractColors,
+    AlphaPremultiply
+};
+
+enum class UITransformOperationType {
+    // 2D operations (existing)
+    TranslateX,
+    TranslateY,
+    ScaleX,
+    ScaleY,
+    Rotate,          // 2D rotation around Z-axis (angle in degrees)
+    // 3D operations (new)
+    TranslateZ,
+    ScaleZ,
+    RotateX,
+    RotateY,
+    RotateZ,         // alternative to Rotate for clarity
+    Rotate3D,     // axis-angle
+    Matrix3D,     // raw 4x4 matrix
+    SkewX,
+    SkewY
+};
+
+struct UITransformOperation {
+    UITransformOperationType type = UITransformOperationType::TranslateX;
+    UIStyleExpression value;
+    std::string source;
+};
+struct UITransformList {
+    std::vector<UITransformOperation> operations;
+};
+using UITransformListRef = std::shared_ptr<const UITransformList>;
+
+struct UICustomPropertyDeclaration {
+    std::string name;
+    std::string raw_value;
+};
+
+// Unresolved descriptor-driven component style property. Unlike --variables,
+// these do not inherit. The parser preserves them without needing registry
+// access; registered UIComponent descriptors validate/apply them at draw time.
+struct UIComponentStyleDeclaration {
+    std::string name;
+    std::string raw_value;
 };
 
 enum class GridTrackUnit {
@@ -258,6 +506,12 @@ enum class PropertyType {
     BackgroundColor,
     BorderColor,
     BorderWidth,
+    BorderTopWidth,
+    BorderRightWidth,
+    BorderBottomWidth,
+    BorderLeftWidth,
+    BorderStyle,
+    Border,
     BorderRadius,
     Width,
     Height,
@@ -341,11 +595,62 @@ enum class PropertyType {
     ,SplitterSize
     ,TabHeight
     ,TabClosable
+    ,ObjectPositionX
+    ,ObjectPositionY
+    ,ImageRotation
+    ,ImagePivotX
+    ,ImagePivotY
+    ,ImageFrame
+    ,ImageFrameWidth
+    ,ImageFrameHeight
+    ,ImageFrameColumns
+    ,ImageSliceLeft
+    ,ImageSliceRight
+    ,ImageSliceTop
+    ,ImageSliceBottom
+    ,ImageSliceScale
+    ,ImageSliceMode
+    ,ImageTileScale
+    ,ImageTileOffsetX
+    ,ImageTileOffsetY
+    ,ImageBlendMode
+    ,ImagePixelSnap
+    ,Content
+    ,Filter
+    ,BackdropFilter
+    ,Effect
+    ,MixBlendMode
+    ,Transform
+    ,Perspective
+    // Parser-only shorthand properties. They expand into existing longhands
+    // and are never stored in a ComputedStyle.
+    ,Background
+    ,Font
+    ,Inset
+    ,Flex
+    ,PlaceItems
+    // 0.7.1 flex/grid alignment additions. Appended to preserve the numeric
+    // values of all existing PropertyType entries.
+    ,FlexWrap
+    ,FlexFlow
+    ,AlignContent
+    ,JustifySelf
+    // Appended, same reasoning as the 0.7.1 block above: keeps every existing
+    // PropertyType's numeric value unchanged. TransformOriginX/Y are the real,
+    // stored-in-ComputedStyle longhands; TransformOrigin is a parser-only
+    // shorthand that expands into both, same pattern as Inset/Flex/PlaceItems.
+    ,TransformOriginX
+    ,TransformOriginY
+    ,TransformOrigin
 };
 
 struct UITransitionSpec {
     bool all = true;
     std::vector<PropertyType> properties;
+    // Dynamic RCSS values such as --strength and shader-strength do not have
+    // fixed PropertyType enum slots. They remain named so the animation layer
+    // can interpolate them without the shader renderer owning animation logic.
+    std::vector<std::string> dynamic_properties;
     float duration = 0.0f;
     float delay = 0.0f;
     UIEasing easing = UIEasing::Ease;
@@ -382,15 +687,27 @@ using PropertyValueType = std::variant<
     DisplayType,
     PositionType,
     FlexDirection,
+    FlexWrap,
     JustifyContent,
     AlignItems,
     AlignSelf,
+    AlignContent,
+    JustifySelf,
     TextAlign,
     OverflowType,
     GridTrackList,
     GridAutoFlow,
     UIImageFit,
-    UIImageSampling
+    UIImageSampling,
+    UIImageSliceMode,
+    UIImageBlendMode,
+    UIGeneratedContentValue,
+    UIDeferredCSSValue,
+    UIFilterListRef,
+    UIShaderEffectListRef,
+    UIMixBlendMode,
+    UITransformListRef,
+    PerspectiveType
 >;
 
 struct Declaration {
@@ -404,6 +721,66 @@ struct Declaration {
           value(std::move(property_value)) {}
 };
 
+// One compound selector in a descendant selector chain. The chain stored on a
+// rule contains only its ancestors; the final target keeps using StyleRule's
+// legacy selector/id/classes fields for source compatibility.
+// Structural pseudo-class `:nth-child(an+b)` / `:nth-last-child(an+b)`.
+// :first-child, :last-child, :only-child, odd and even are normalised into
+// this form by the parser.
+struct UIStructuralPseudo {
+    bool from_end = false;
+    int a = 0;
+    int b = 0;
+};
+
+// True when 1-based position `index` (of `count` siblings) matches all entries.
+bool StructuralPseudosMatch(
+    const std::vector<UIStructuralPseudo>& pseudos,
+    std::size_t index,
+    std::size_t count
+);
+
+struct StyleSelector {
+    SelectorType selector = SelectorType::Any;
+    CSS_Id id = std::monostate{};
+    std::vector<std::string> classes;
+    std::vector<std::string> pseudo_states;
+    // Required structural pseudo-classes (rules) ...
+    std::vector<UIStructuralPseudo> structural;
+    // ... and the element's own position (snapshots). 1-based; 0 = unknown.
+    std::size_t sibling_index = 0;
+    std::size_t sibling_count = 0;
+};
+
+// Persistent nearest-first chain of preceding siblings. Sharing the chain avoids
+// copying every earlier sibling into every child when + or ~ selectors exist.
+struct StyleSelectorSiblingNode;
+using StyleSelectorSiblingChain =
+    std::shared_ptr<const StyleSelectorSiblingNode>;
+
+struct StyleSelectorSiblingNode {
+    StyleSelector selector;
+    StyleSelectorSiblingChain previous;
+    std::size_t cumulative_hash = 0;
+    std::size_t count = 0;
+};
+
+enum class SelectorCombinator {
+    Descendant,
+    Child,
+    AdjacentSibling,
+    GeneralSibling
+};
+
+struct UIMediaQuery {
+    std::optional<float> min_width;
+    std::optional<float> max_width;
+    std::optional<float> min_height;
+    std::optional<float> max_height;
+    // Empty, "landscape", or "portrait".
+    std::string orientation;
+};
+
 struct StyleRule {
     SelectorType selector = SelectorType::Any;
     CSS_Id id = std::monostate{};
@@ -412,7 +789,21 @@ struct StyleRule {
     // selectors use pseudo_states and may contain any number of names.
     SelectorState state = SelectorState::None;
     std::vector<std::string> pseudo_states;
+    std::vector<UIStructuralPseudo> structural;
+    // Ordered from the left-most selector to the compound immediately before
+    // the target. Combinators describe each relationship to the next compound.
+    std::vector<StyleSelector> ancestors;
+    std::vector<SelectorCombinator> combinators;
+    // Empty means unconditional. Multiple queries use comma/OR semantics.
+    std::vector<UIMediaQuery> media_queries;
     std::vector<Declaration> declarations;
+    std::vector<UICustomPropertyDeclaration> custom_properties;
+    std::vector<UIComponentStyleDeclaration> component_style_properties;
+    std::vector<UIShaderUniformBinding> shader_uniforms;
+    UIGeneratedPseudoKind pseudo_element = UIGeneratedPseudoKind::None;
+    // Precomputed once by TouchStyleSheet(); avoids recomputing specificity on
+    // every style resolution.
+    int specificity = 0;
     bool transitions_declared = false;
     std::vector<UITransitionSpec> transitions;
     bool animations_declared = false;
@@ -422,6 +813,9 @@ struct StyleRule {
 struct UIKeyframeStep {
     float offset = 0.0f;
     std::vector<Declaration> declarations;
+    // Descriptor-driven custom component style values share the same timeline
+    // as ordinary RCSS declarations.
+    std::vector<UIComponentStyleDeclaration> component_style_properties;
 };
 
 struct UIKeyframes {
@@ -433,18 +827,132 @@ std::size_t NextStyleSheetRevision();
 
 void ClearResolvedStyleCache();
 
+struct StyleSheet;
+struct ComputedStyle;
+bool UIPropertyAffectsLayout(PropertyType property);
+bool IsUILayoutProperty(PropertyType property);
+bool UIAnimationTouchesLayout(
+    const StyleSheet& style_sheet,
+    const std::string& animation_name
+);
+
 struct StyleSheet {
     std::vector<StyleRule> rules;
     std::unordered_map<std::string,UIKeyframes> keyframes;
+    std::shared_ptr<const UIStyleVariableMap> root_custom_properties;
+    // Precomputed by TouchStyleSheet(). Most stylesheets do not use + or ~,
+    // so layout can skip all sibling-context bookkeeping.
+    bool uses_sibling_combinators = false;
+    // Set when any rule uses :nth-child / :first-child / :last-child etc.
+    bool uses_structural_selectors = false;
+    // These flags let the retained frame skip a complete tree traversal when
+    // pseudo states and animations cannot alter layout.
+    bool uses_layout_pseudo_states = false;
+    bool uses_layout_animations = false;
+    // Internal pseudo-element use is reduced to a bit mask so draw paths can
+    // bypass selector resolution for parts that the stylesheet never styles.
+    std::uint32_t used_internal_parts = 0;
+    // Coarse target-pseudo index. It prevents labels, images, inputs, and
+    // containers with no matching :state rule from entering the pseudo-style
+    // resolver on every draw.
+    std::uint64_t target_pseudo_selector_mask = 0;
+    bool uses_unqualified_any_target_pseudo = false;
+    std::unordered_set<std::string> target_pseudo_classes;
+    std::unordered_set<std::size_t> target_pseudo_ids;
+    bool uses_before_pseudo = false;
+    bool uses_after_pseudo = false;
+    std::uint64_t before_pseudo_selector_mask = 0;
+    std::uint64_t after_pseudo_selector_mask = 0;
+    bool uses_unqualified_before_pseudo = false;
+    bool uses_unqualified_after_pseudo = false;
+    std::unordered_set<std::string> before_pseudo_classes;
+    std::unordered_set<std::string> after_pseudo_classes;
+    std::unordered_set<std::size_t> before_pseudo_ids;
+    std::unordered_set<std::size_t> after_pseudo_ids;
+    bool uses_compositing = false;
+    bool uses_backdrop_filters = false;
+    // Coarse owner-effect index. Unrelated elements skip compositing style
+    // resolution even when some other rule in the stylesheet uses effects.
+    std::uint64_t compositing_selector_mask = 0;
+    bool uses_unqualified_compositing = false;
+    std::unordered_set<std::string> compositing_classes;
+    std::unordered_set<std::size_t> compositing_ids;
+    // Rules are indexed by target selector. Normal elements scan their type
+    // plus wildcard rules instead of every rule in the stylesheet.
+    std::array<std::vector<std::size_t>,32> rules_by_selector;
+    std::vector<std::size_t> wildcard_rules;
     std::size_t revision = NextStyleSheetRevision();
 };
 
 inline const StyleSheet* CSS_UI_ACTIVE_STYLE_SHEET = nullptr;
 inline bool CSS_UI_LAYOUT_CHANGE_REQUESTED = false;
 inline bool CSS_UI_SCROLL_INPUT_CONSUMED = false;
+// Prevent popup interactions from clicking controls drawn underneath.
+inline bool CSS_UI_POINTER_INPUT_CONSUMED = false;
 inline MouseCursor CSS_UI_REQUESTED_CURSOR = MOUSE_CURSOR_DEFAULT;
+inline float CSS_UI_VIEWPORT_WIDTH = 0.0f;
+// Temporary diagnostic switch — see the TraceLog call at the end of
+// DrawUICompositedLayer in ui_effects.cpp. Set to true to get console
+// output showing which compositing branch ran and the actual computed
+// transform matrix for each composited element. Safe to delete once the
+// perspective/transform disappearing bug is resolved.
+inline bool CSS_UI_DEBUG_COMPOSITING = false;
+inline float CSS_UI_VIEWPORT_HEIGHT = 0.0f;
+inline float CSS_UI_ROOT_FONT_SIZE = 16.0f; // browser default (1rem = 16px)
+// Non-zero only while an affected subtree is rendered into a local effect target.
+// Scissor rectangles are framebuffer-space and therefore subtract this origin.
+inline Vector2 CSS_UI_DRAW_TARGET_ORIGIN = {0.0f,0.0f};
+// Retained-mode fast path. When false, layout changes must call
+// MarkLayoutDirty()/UI::InvalidateLayout() instead of relying on a full-tree
+// mutation hash every frame.
+inline bool CSS_UI_DETECT_LAYOUT_MUTATIONS = true;
+
+// -----------------------------------------------------------------
+// UI traversal coordinate contexts
+// -----------------------------------------------------------------
+// Normal RUI uses identity screen coordinates. Viewport pushes a logical
+// pointer context and a uniform 2D transform so existing controls can keep
+// their retained logical rectangles while rendering/hit-testing through a
+// transformed coordinate space. Stacks intentionally support nesting.
+struct UIInputContext {
+    Vector2 mouse_position{};
+    Vector2 mouse_delta{};
+};
+
+struct UITransformContext {
+    Vector2 offset{};
+    float scale = 1.0f;
+};
+
+Vector2 GetUIMousePosition();
+Vector2 GetUIMouseDelta();
+void PushUIInputContext(const UIInputContext& context);
+void PopUIInputContext();
+
+UITransformContext GetCurrentUITransform();
+void PushUITransform(Vector2 translation, float scale);
+void PushUITransformAbsolute(const UITransformContext& transform);
+void PopUITransform();
+
+Vector2 UITransformPointToScreen(Vector2 point);
+Vector2 UIScreenPointToLogical(Vector2 point);
+Rectangle UITransformRectangleToScreen(Rectangle rectangle);
+Rectangle UIScreenRectangleToLogical(Rectangle rectangle);
+Rectangle CurrentUIVisibleLogicalScreenRect();
+void BeginUIScissorMode(Rectangle logical_rectangle);
 
 void TouchStyleSheet(StyleSheet& style_sheet);
+
+std::uint32_t UIInternalPartMask(std::string_view part_class);
+bool StyleSheetUsesPart(
+    const StyleSheet& style_sheet,
+    std::string_view part_class
+);
+bool StyleMayUseTargetPseudo(
+    const StyleSheet& style_sheet,
+    SelectorType selector,
+    const ComputedStyle& style
+);
 
 StyleSheet MakeDefaultUIStyleSheet();
 
@@ -468,28 +976,14 @@ inline const char* IndexToString(std::size_t index, const std::array<const char*
     return names[index];
 }
 
-constexpr std::array<const char*, 21> value_type_names = {
-    "Color",
-    "string",
-    "float",
-    "int",
-    "bool",
-    "Vector2",
-    "Vector3",
-    "Vector4",
-    "CSSLength",
-    "DisplayType",
-    "PositionType",
-    "FlexDirection",
-    "JustifyContent",
-    "AlignItems",
-    "AlignSelf",
-    "TextAlign",
-    "OverflowType",
-    "GridTrackList",
-    "GridAutoFlow",
-    "UIImageFit",
-    "UIImageSampling"
+constexpr std::array<const char*, 29> value_type_names = {
+    "Color", "string", "float", "int", "bool",
+    "Vector2", "Vector3", "Vector4", "CSSLength",
+    "DisplayType", "PositionType", "FlexDirection", "JustifyContent",
+    "AlignItems", "AlignSelf", "TextAlign", "OverflowType",
+    "GridTrackList", "GridAutoFlow", "UIImageFit", "UIImageSampling",
+    "UIImageSliceMode", "UIImageBlendMode", "GeneratedContentValue",
+    "DeferredCSSValue", "FilterList", "ShaderEffectList", "MixBlendMode", "TransformList"
 };
 
 //--------------------------------------------------------------------
@@ -505,13 +999,30 @@ enum class InputType {
     ColorPicker
 };
 
+enum class InputLabelLayout {
+    Front, // Label follows the value/control.
+    Back   // Label precedes the value/control.
+};
+
+enum class UISliderOrientation {
+    Horizontal,
+    Vertical
+};
+
 // Synthetic classes used internally to represent input pseudo-elements.
+inline constexpr const char* CSS_INPUT_LABEL_PART ="__css-input-label";
 inline constexpr const char* CSS_INPUT_VALUE_BOX_PART ="__css-input-value-box";
 inline constexpr const char* CSS_INPUT_DECREMENT_BUTTON_PART ="__css-input-decrement-button";
 inline constexpr const char* CSS_INPUT_INCREMENT_BUTTON_PART ="__css-input-increment-button";
 inline constexpr const char* CSS_INPUT_SLIDER_TRACK_PART ="__css-input-slider-track";
 inline constexpr const char* CSS_INPUT_SLIDER_FILL_PART ="__css-input-slider-fill";
 inline constexpr const char* CSS_INPUT_SLIDER_HANDLE_PART ="__css-input-slider-handle";
+// Vector and color component captions such as X/Y/Z/W and R/G/B/A.
+inline constexpr const char* CSS_INPUT_COMPONENT_LABEL_PART ="__css-input-component-label";
+inline constexpr const char* CSS_INPUT_COMPONENT_0_LABEL_PART ="__css-input-component-0-label";
+inline constexpr const char* CSS_INPUT_COMPONENT_1_LABEL_PART ="__css-input-component-1-label";
+inline constexpr const char* CSS_INPUT_COMPONENT_2_LABEL_PART ="__css-input-component-2-label";
+inline constexpr const char* CSS_INPUT_COMPONENT_3_LABEL_PART ="__css-input-component-3-label";
 inline constexpr const char* CSS_UI_HEADER_PART ="__css-ui-header";
 inline constexpr const char* CSS_UI_POPUP_PART ="__css-ui-popup";
 inline constexpr const char* CSS_UI_ITEM_PART ="__css-ui-item";
@@ -529,10 +1040,16 @@ inline constexpr const char* CSS_UI_SPLITTER_HANDLE_PART ="__css-ui-splitter-han
 //--------------------------------------------------------------------
 
 
-constexpr std::array<const char*, 86> property_names = {
+constexpr std::array<const char*, 131> property_names = {
     "background-color",
     "border-color",
     "border-width",
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "border-style",
+    "border",
     "border-radius",
     "width",
     "height",
@@ -615,7 +1132,46 @@ constexpr std::array<const char*, 86> property_names = {
     "image-flip-y",
     "splitter-size",
     "tab-height",
-    "tab-closable"
+    "tab-closable",
+    "object-position-x",
+    "object-position-y",
+    "image-rotation",
+    "image-pivot-x",
+    "image-pivot-y",
+    "image-frame",
+    "image-frame-width",
+    "image-frame-height",
+    "image-frame-columns",
+    "image-slice-left",
+    "image-slice-right",
+    "image-slice-top",
+    "image-slice-bottom",
+    "image-slice-scale",
+    "image-slice-mode",
+    "image-tile-scale",
+    "image-tile-offset-x",
+    "image-tile-offset-y",
+    "image-blend-mode",
+    "image-pixel-snap",
+    "content",
+    "filter",
+    "backdrop-filter",
+    "effect",
+    "mix-blend-mode",
+    "transform",
+    "perspective",
+    "background",
+    "font",
+    "inset",
+    "flex",
+    "place-items",
+    "flex-wrap",
+    "flex-flow",
+    "align-content",
+    "justify-self",
+    "transform-origin-x",
+    "transform-origin-y",
+    "transform-origin"
 };
 
 //--------------------------------------------------------------------
@@ -652,23 +1208,64 @@ void SetUIFontRegistry(const std::unordered_map<std::string,Font>& fonts);
 
 Font ResolveUIFont(const std::string& name);
 
+// Draws text on whole-pixel coordinates. The glyph atlas is sampled with a
+// bilinear filter, so a fractional position (for example the vertical-centering
+// half pixel) smears small text. Every text draw goes through this.
+inline void DrawUIText(
+    Font font,
+    const char* text,
+    Vector2 position,
+    float font_size,
+    float spacing,
+    Color tint
+) {
+    position.x = std::round(position.x);
+    position.y = std::round(position.y);
+    DrawTextEx(font,text,position,font_size,spacing,tint);
+}
+
 void ClearTextMeasureCache();
 
 bool AddUIFont(
     std::unordered_map<std::string,Font>& fonts,
     const std::string& name,
     const std::string& path,
-    int base_size = 32
+    int base_size = 32,
+    // Codepoints to rasterise. Empty = default set (ASCII, Latin-1, Latin
+    // Extended-A, common punctuation, arrows, symbols).
+    const std::vector<int>& codepoints = {}
 );
+
+std::vector<int> DefaultUICodepoints();
+
+// Vertical extent of a font's glyph ink relative to the text origin (the y
+// passed to DrawTextEx), scaled to `font_size`. `top` is the top of tall
+// letters/ascenders, `bottom` the bottom of descenders. Carets and selection
+// rectangles use this instead of assuming the box spans [0,font_size].
+struct UIFontVerticalExtent {
+    float top = 0.0f;
+    float bottom = 0.0f;
+    float Height() const { return bottom-top; }
+};
+
+UIFontVerticalExtent MeasureFontVerticalExtent(Font font,float font_size);
 
 void UnloadUIFonts(std::unordered_map<std::string,Font>& fonts);
 
 struct ComputedStyle {
     Color background_color = BLANK;
     Color border_color = BLANK;
-    Color text_color = WHITE;
-
+    Color text_color = Color{0,0,0,255};
+    Matrix transform_matrix=MatrixIdentity();
+    // Retained for compatibility with existing widget metrics. It mirrors
+    // the maximum side width while border_widths stores CSS per-side values.
     float border_width = 0.0f;
+    EdgeValues border_widths;
+    UIBorderStyle border_style = UIBorderStyle::Solid;
+    // RCSS compatibility: unitless values in [0,1] retain raylib-style
+    // normalized roundness. Pixel values are stored as negative numbers by
+    // the parser so e.g. 1px is distinguishable from legacy roundness 1.0.
+    // Values > 1 from the C++ fluent API are also treated as pixel radii.
     float border_radius = 0.0f;
     // Unitless local scale from CSS. The applied values are tracked so a
     // repeated layout pass can restore unscaled metrics before resolving.
@@ -683,13 +1280,13 @@ struct ComputedStyle {
     float min_height = 0.0f;
     float max_height = std::numeric_limits<float>::max();
 
-    float font_size = 20.0f;
-    float gap = 8.0f;
-    float row_gap = 8.0f;
-    float column_gap = 8.0f;
+    float font_size = 16.0f;
+    float gap = 0.0f;
+    float row_gap = 0.0f;
+    float column_gap = 0.0f;
     float opacity = 1.0f;
     float scroll_speed = 36.0f;
-    float scrollbar_size = 10.0f;
+    float scrollbar_size = 15.0f;
     float header_height = 30.0f;
     float item_height = 28.0f;
     float popup_width = 220.0f;
@@ -699,12 +1296,69 @@ struct ComputedStyle {
     float splitter_size = 6.0f;
     float tab_height = 32.0f;
     Color image_tint = WHITE;
-    UIImageFit image_fit = UIImageFit::Contain;
-    UIImageSampling image_sampling = UIImageSampling::Nearest;
+    UIImageFit image_fit = UIImageFit::Stretch; // object-fit: fill
+    UIImageSampling image_sampling = UIImageSampling::Bilinear;
     bool image_flip_x = false;
     bool image_flip_y = false;
+    Vector2 image_position = {0.5f,0.5f};
+    float image_rotation = 0.0f;
+    Vector2 image_pivot = {0.5f,0.5f};
+    int image_frame = 0;
+    Vector2 image_frame_size = {};
+    int image_frame_columns = 0;
+    EdgeValues image_slice;
+    float image_slice_scale = 1.0f;
+    UIImageSliceMode image_slice_mode = UIImageSliceMode::Stretch;
+    float image_tile_scale = 1.0f;
+    Vector2 image_tile_offset = {};
+    UIImageBlendMode image_blend_mode = UIImageBlendMode::Alpha;
+    bool image_pixel_snap = false;
+
+    // Generated pseudo-element content. The explicit flag distinguishes
+    // content: "" from no content declaration.
+    std::string generated_content;
+    bool generated_content_defined = false;
+
+    // Effect data is pointer-backed so the ordinary fast path adds only cheap
+    // null checks and never owns per-element vectors.
+    UIFilterListRef filters;
+    UIFilterListRef backdrop_filters;
+    UIShaderEffectListRef shader_effects;
+    UIShaderUniformListRef shader_uniforms;
+    UIMixBlendMode mix_blend_mode = UIMixBlendMode::Normal;
+    UITransformListRef transform_operations;
+    // Origin for scale/rotate/skew/3D transforms, as a length/percentage of the
+    // element's own box. Unset (nullopt), same convention as left_length/
+    // top_length/etc., means "not specified" — resolved to the 50%/50% center
+    // default at the point of use in EvaluateTransformMatrix.
+    std::optional<CSSLength> transform_origin_x_length;
+    std::optional<CSSLength> transform_origin_y_length;
+
+    // Custom properties inherit. Maps are shared and only materialized for
+    // stylesheets/elements that actually use --variables.
+    std::shared_ptr<const UIStyleVariableMap> inherited_custom_properties;
+    // font-family inherits like in CSS: seeded from the parent's computed font
+    // and overridden only when a matching rule sets font-family.
+    std::string inherited_font;
+    // color inherits too. `*_inherited` records that the current value came
+    // from inheritance (so it follows the parent) rather than from a rule or
+    // the C++ fluent API (which stay in force).
+    std::optional<Color> inherited_text_color;
+    // Set by the C++ fluent API so an explicit colour is not replaced by the
+    // inherited one.
+    bool text_color_explicit = false;
+    // 1-based position among siblings and sibling count. Only filled in when
+    // the stylesheet uses structural selectors (0 otherwise).
+    std::size_t sibling_index = 0;
+    std::size_t sibling_count = 0;
+    std::shared_ptr<const UIStyleVariableMap> custom_properties;
+    // Non-inherited descriptor-driven RCSS values such as Graph.grid-color.
+    // Stored as text so the component registry remains the authoritative type
+    // converter/validator and the animation engine can interpolate them.
+    std::shared_ptr<const UIStyleVariableMap> component_style_properties;
 
     std::optional<CSSLength> border_width_length;
+    EdgeLengthValues border_width_lengths;
     std::optional<CSSLength> width_length;
     std::optional<CSSLength> height_length;
     std::optional<CSSLength> min_width_length;
@@ -723,7 +1377,7 @@ struct ComputedStyle {
     std::optional<CSSLength> indent_length;
     std::optional<CSSLength> splitter_size_length;
     std::optional<CSSLength> tab_height_length;
-
+    std::optional<CSSLength> perspective;
     PositionType position = PositionType::Static;
     float left = 0.0f;
     float right = 0.0f;
@@ -736,16 +1390,21 @@ struct ComputedStyle {
     std::optional<CSSLength> bottom_length;
 
     std::string font="default";    
-    FlexDirection flex_direction = FlexDirection::Column;
+    FlexDirection flex_direction = FlexDirection::Row;
+    FlexWrap flex_wrap = FlexWrap::NoWrap;
     JustifyContent justify_content = JustifyContent::FlexStart;
     AlignItems align_items = AlignItems::FlexStart;
-    AlignItems justify_items = AlignItems::Stretch;
+    AlignItems justify_items = AlignItems::FlexStart;
     AlignSelf align_self = AlignSelf::Auto;
+    // nullopt preserves pre-0.7.1 grid track placement. Flex wrapping uses
+    // CSS's default stretch behavior when align-content is omitted.
+    std::optional<AlignContent> align_content;
+    JustifySelf justify_self = JustifySelf::Auto;
     float flex_grow = 0.0f;
     float flex_shrink = 1.0f;
     float flex_basis = -1.0f;
     std::optional<CSSLength> flex_basis_length;
-    TextAlign text_align = TextAlign::Center;
+    TextAlign text_align = TextAlign::Left;
     OverflowType overflow = OverflowType::Visible;
     int grid_template_columns = 1;
     int grid_template_rows = 0;
@@ -783,6 +1442,13 @@ struct ComputedStyle {
     std::vector<UIAnimationSpec> animations;
     CSS_Id id = std::monostate{};
     std::vector<std::string> classes;
+    // Runtime selector identity and selector context used by descendant,
+    // child, adjacent-sibling, and general-sibling combinators.
+    SelectorType selector = SelectorType::Any;
+    std::vector<StyleSelector> selector_ancestors;
+    std::vector<StyleSelectorSiblingChain>
+        selector_ancestor_previous_siblings;
+    StyleSelectorSiblingChain selector_previous_siblings;
     DisplayType display = DisplayType::Inline;
     EdgeValues padding;
     EdgeValues margin;
@@ -801,6 +1467,32 @@ std::size_t HashFloat(float value);
 std::size_t HashColor(Color color);
 
 std::size_t HashCSSLength(const CSSLength& length);
+//--------------------------------------------------------------------
+// CSS ID utilities
+//--------------------------------------------------------------------
+
+bool HasCSSId(const CSS_Id& id);
+
+bool HasCSSClass(const std::vector<std::string>& classes, const std::string& class_name);
+
+void AddCSSClass(std::vector<std::string>& classes, const std::string& class_name);
+
+bool RemoveCSSClass(std::vector<std::string>& classes, const std::string& class_name);
+
+bool ToggleCSSClass(std::vector<std::string>& classes, const std::string& class_name);
+
+void ClearCSSClasses(std::vector<std::string>& classes);
+
+Color WithOpacity(Color color, float opacity);
+
+Color MixColors(Color first, Color second, float amount);
+
+Color LightenColor(Color color, float amount);
+
+Color DarkenColor(Color color, float amount);
+
+Color ApplyStyleOpacity(Color color, float opacity);
+
 
 template <typename T, typename HashValue>
 inline void HashOptional(
@@ -816,22 +1508,33 @@ inline void HashOptional(
 
 std::size_t HashCSSId(const CSS_Id& id);
 
+std::size_t HashStyleSelector(const StyleSelector& selector);
+
+StyleSelectorSiblingChain AppendStyleSelectorSibling(
+    StyleSelectorSiblingChain previous,
+    StyleSelector selector
+);
+
 std::size_t HashComputedStyle(const ComputedStyle& style);
 
 struct ResolvedStyleCacheKey {
     const StyleSheet* style_sheet = nullptr;
     std::size_t revision = 0;
     std::size_t base_hash = 0;
+    std::size_t pseudo_hash = 0;
     SelectorType selector = SelectorType::Any;
     SelectorState state = SelectorState::None;
+    bool pseudo_states = false;
 
     bool operator==(const ResolvedStyleCacheKey& other) const {
         return
             style_sheet == other.style_sheet &&
             revision == other.revision &&
             base_hash == other.base_hash &&
+            pseudo_hash == other.pseudo_hash &&
             selector == other.selector &&
-            state == other.state;
+            state == other.state &&
+            pseudo_states == other.pseudo_states;
     }
 };
 
@@ -842,8 +1545,10 @@ struct ResolvedStyleCacheKeyHash {
 
         HashCombine(seed,key.revision);
         HashCombine(seed,key.base_hash);
+        HashCombine(seed,key.pseudo_hash);
         HashCombine(seed,static_cast<std::size_t>(key.selector));
         HashCombine(seed,static_cast<std::size_t>(key.state));
+        HashCombine(seed,std::hash<bool>{}(key.pseudo_states));
         return seed;
     }
 };
@@ -1028,7 +1733,30 @@ struct UIElementAnimationState;
 struct UILayoutAnimationState;
 
 struct UIElementBase;
+struct UIGeneratedPseudoElementState;
 void UpdateElementDragDrop(UIElementBase& element);
+
+enum class UIDirtyFlags : std::uint32_t {
+    None = 0,
+    Style = 1u << 0,
+    Layout = 1u << 1,
+    Paint = 1u << 2,
+    Composite = 1u << 3,
+    EffectParameters = 1u << 4,
+    PseudoElements = 1u << 5,
+    All = 0xffffffffu
+};
+inline UIDirtyFlags operator|(UIDirtyFlags a, UIDirtyFlags b) {
+    return static_cast<UIDirtyFlags>(static_cast<std::uint32_t>(a)|static_cast<std::uint32_t>(b));
+}
+inline UIDirtyFlags& operator|=(UIDirtyFlags& a, UIDirtyFlags b) { a=a|b; return a; }
+inline bool HasUIDirtyFlag(UIDirtyFlags value, UIDirtyFlags flag) {
+    return (static_cast<std::uint32_t>(value)&static_cast<std::uint32_t>(flag))!=0;
+}
+
+// Central property invalidation classification. New RCSS properties should be
+// added here rather than scattering layout/paint/composite decisions.
+UIDirtyFlags UIPropertyDirtyFlags(PropertyType property);
 
 struct UIElementBase {
     Rectangle transform = {
@@ -1050,16 +1778,58 @@ struct UIElementBase {
     UIPseudoStateSet pseudo_states;
     std::shared_ptr<UIDragSourceBinding> drag_source;
     std::shared_ptr<UIDropTargetBinding> drop_target;
+    // Opaque per-widget payload. Markup `userData="{...}"` stores a UIXValue
+    // here; read it back with rui::Context::FocusedUserData().
+    std::any user_data;
+    // Focus transition callbacks wired from markup onFocus/onBlur. They are
+    // fired by rui::Context::Update when the focused widget changes.
+    std::function<void()> on_focus;
+    std::function<void()> on_blur;
+    // Wired from markup onKey. Polls this widget's key bindings and runs the
+    // matching handler; returns true if one fired. rui::Context::Update calls
+    // it once per frame, only for the focused widget.
+    std::function<bool()> on_key;
     std::size_t last_layout_pseudo_hash = 0;
+    // Incremented whenever layout resolves a new base style. Draw-time
+    // pseudo-style caching uses this instead of hashing the full style object.
+    std::size_t style_generation = 1;
+    std::size_t cached_interactive_style_generation = 0;
+    std::size_t cached_interactive_sheet_revision = 0;
+    std::size_t cached_interactive_pseudo_hash = 0;
+    std::size_t cached_interactive_overlay_hash = 0;
+    // Monotonic identity for the cached target style. Animation channels use
+    // it instead of hashing transition/animation vectors every frame.
+    std::size_t cached_interactive_style_revision = 1;
+    SelectorType cached_interactive_selector = SelectorType::Any;
+    std::shared_ptr<ComputedStyle> cached_interactive_style;
     // Shared so moving widgets in vectors does not invalidate active tweens.
     std::shared_ptr<UIElementAnimationState> animation_state;
     std::shared_ptr<UILayoutAnimationState> layout_animation_state;
+    // Lazily created only when the stylesheet actually generates ::before/after
+    // or this element uses an effect.
+    std::shared_ptr<UIGeneratedPseudoElementState> generated_pseudo_state;
+    UIDirtyFlags dirty_flags = UIDirtyFlags::All;
 
     UIElementBase() = default;
 
     explicit UIElementBase(Rectangle initial_transform)
         : transform(initial_transform),
           layout_transform(initial_transform) {}
+};
+
+struct UIGeneratedPseudoElement {
+    UIElementBase element;
+    ComputedStyle style;
+    Rectangle paint_rect = {};
+    bool active = false;
+    std::size_t owner_style_generation = 0;
+    std::size_t sheet_revision = 0;
+    std::size_t pseudo_hash = 0;
+};
+
+struct UIGeneratedPseudoElementState {
+    std::shared_ptr<UIGeneratedPseudoElement> before;
+    std::shared_ptr<UIGeneratedPseudoElement> after;
 };
 
 template <typename Derived>
@@ -1288,6 +2058,21 @@ struct UIStyleFluent {
         return Self();
     }
 
+    Derived& Wrap(FlexWrap value = FlexWrap::Wrap) {
+        Self().style.flex_wrap = value;
+        return Self();
+    }
+
+    Derived& AlignContentMode(AlignContent value) {
+        Self().style.align_content = value;
+        return Self();
+    }
+
+    Derived& JustifySelfMode(JustifySelf value) {
+        Self().style.justify_self = value;
+        return Self();
+    }
+
     Derived& Display(DisplayType value) {
         Self().style.display = value;
         return Self();
@@ -1330,6 +2115,7 @@ struct UIStyleFluent {
 
     Derived& Foreground(Color value) {
         Self().style.text_color = value;
+        Self().style.text_color_explicit = true;
         return Self();
     }
 
@@ -1340,8 +2126,14 @@ struct UIStyleFluent {
     ) {
         Self().style.border_color = color;
         Self().style.border_width = width;
+        Self().style.border_widths = EdgeValues(width);
+        Self().style.border_style = UIBorderStyle::Solid;
         Self().style.border_width_length =
             CSSLength{width,LengthUnit::Pixels};
+        Self().style.border_width_lengths.left = Self().style.border_width_length;
+        Self().style.border_width_lengths.right = Self().style.border_width_length;
+        Self().style.border_width_lengths.top = Self().style.border_width_length;
+        Self().style.border_width_lengths.bottom = Self().style.border_width_length;
         Self().style.border_radius = radius;
         return Self();
     }
@@ -1393,6 +2185,10 @@ struct UIComboBox : UIStyleFluent<UIComboBox> {
     ComputedStyle style;
     std::string placeholder = "Select...";
     std::vector<std::string> items;
+    // Optional per-item CSS classes (parallel to `items`, may be shorter).
+    // Style them with `.my-class::item { ... }`. Every item also receives
+    // `option-<index>` (0-based) so items can be targeted by position.
+    std::vector<std::vector<std::string>> item_classes;
     int selected_index = -1;
     int hovered_index = -1;
     bool open = false;
@@ -1408,6 +2204,12 @@ struct UIComboBox : UIStyleFluent<UIComboBox> {
     UIComboBox& Placeholder(std::string value) { placeholder = std::move(value); return *this; }
     UIComboBox& Items(std::vector<std::string> value) { items = std::move(value); return *this; }
     UIComboBox& AddItem(std::string value) { items.push_back(std::move(value)); return *this; }
+    UIComboBox& AddItem(std::string value,std::vector<std::string> classes) {
+        item_classes.resize(items.size());
+        items.push_back(std::move(value));
+        item_classes.push_back(std::move(classes));
+        return *this;
+    }
     UIComboBox& SelectedIndex(int value) { selected_index = value; return *this; }
     UIComboBox& Open(bool value = true) { open = value; return *this; }
     UIComboBox& Disabled(bool value = true) { disabled = value; return *this; }
@@ -1510,6 +2312,19 @@ struct UIImage : UIStyleFluent<UIImage> {
     UIImageSampling sampling = UIImageSampling::Nearest;
     bool flip_x = false;
     bool flip_y = false;
+    Vector2 position = {0.5f,0.5f};
+    float rotation = 0.0f;
+    Vector2 pivot = {0.5f,0.5f};
+    int frame = 0;
+    Vector2 frame_size = {};
+    int frame_columns = 0;
+    EdgeValues slice;
+    float slice_scale = 1.0f;
+    UIImageSliceMode slice_mode = UIImageSliceMode::Stretch;
+    float tile_scale = 1.0f;
+    Vector2 tile_offset = {};
+    UIImageBlendMode blend_mode = UIImageBlendMode::Alpha;
+    bool pixel_snap = false;
     float zoom = 1.0f;
     Vector2 pan{};
     bool interactive = false;
@@ -1531,6 +2346,37 @@ struct UIImage : UIStyleFluent<UIImage> {
     UIImage& Fit(UIImageFit value) { fit = value; return *this; }
     UIImage& Sampling(UIImageSampling value) { sampling = value; return *this; }
     UIImage& Flip(bool x, bool y) { flip_x = x; flip_y = y; return *this; }
+    UIImage& Position(Vector2 value) { position = value; return *this; }
+    UIImage& Rotation(float degrees) { rotation = degrees; return *this; }
+    UIImage& Pivot(Vector2 value) { pivot = value; return *this; }
+    UIImage& Frame(int value, Vector2 size, int columns = 0) {
+        frame = std::max(0,value);
+        frame_size = size;
+        frame_columns = std::max(0,columns);
+        return *this;
+    }
+    UIImage& NineSlice(float all, UIImageSliceMode mode = UIImageSliceMode::Stretch) {
+        slice = EdgeValues(all);
+        slice_mode = mode;
+        return *this;
+    }
+    UIImage& NineSlice(float left, float top, float right, float bottom,
+                       UIImageSliceMode mode = UIImageSliceMode::Stretch) {
+        slice.left = left;
+        slice.right = right;
+        slice.top = top;
+        slice.bottom = bottom;
+        slice_mode = mode;
+        return *this;
+    }
+    UIImage& SliceScale(float value) { slice_scale = value; return *this; }
+    UIImage& Tile(float scale, Vector2 offset = {}) {
+        tile_scale = scale;
+        tile_offset = offset;
+        return *this;
+    }
+    UIImage& Blend(UIImageBlendMode value) { blend_mode = value; return *this; }
+    UIImage& PixelSnap(bool value = true) { pixel_snap = value; return *this; }
     UIImage& Zoom(float value) { zoom = value; return *this; }
     UIImage& Pan(Vector2 value) { pan = value; return *this; }
     UIImage& Interactive(bool value = true) { interactive = value; return *this; }
@@ -1639,17 +2485,30 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
     UIElementBase rect;
     ComputedStyle style;
 
-    // Trigger caption, checkbox caption, or optional field label.
+    // Trigger caption, checkbox caption, or optional scalar field label.
     std::string text = "";
     std::string placeholder;
+    bool show_label = true;
+    InputLabelLayout label_layout = InputLabelLayout::Back;
 
     InputType input_type = InputType::Instant;
-    InputStepButtonLayout step_button_layout =InputStepButtonLayout::Opposite;
+    InputStepButtonLayout step_button_layout =InputStepButtonLayout::Front;
     T value{};
     T min{};
     T max{};
+
+    // Optional direct C++ two-way binding. Bind() pulls the pointed value when
+    // no explicit Value() was supplied. An explicit Value() wins initialisation
+    // regardless of whether it appears before or after Bind().
+    T* bound_value = nullptr;
+    bool pending_explicit_value = false;
     T step = []() {
-        if constexpr(std::is_arithmetic_v<T> && !std::is_same_v<T,bool>) {
+        if constexpr(std::is_floating_point_v<T>) {
+            // Float sliders commonly use normalized or fractional ranges.
+            // A default step of 1 collapsed a 0..1 slider to only 0 or 1.
+            return T{0.01};
+        }
+        else if constexpr(std::is_integral_v<T> && !std::is_same_v<T,bool>) {
             return T{1};
         }
         else {
@@ -1683,6 +2542,7 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
     float drag_speed = 0.01f;
     T drag_start_value{};
     float drag_accumulator = 0.0f;
+    UISliderOrientation slider_orientation = UISliderOrientation::Horizontal;
     bool slider_show_value = true;
     float slider_value_width = 72.0f;
     bool slider_click_to_set = true;
@@ -1695,12 +2555,44 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
     float picker_saturation = 0.0f;
     float picker_brightness = 0.0f;
     int picker_drag_region = 0;
-
-    // Text-entry state.
+    std::shared_ptr<UIInput<std::string>> hex_input;
+    bool hex_input_was_focused = false;
+    bool hex_input_initialized = false;
+    // Text-entry state. Drag numeric inputs enter this same editing path on
+    // a double click while retaining normal single-click drag behavior.
     bool submitted = false;
     std::size_t max_characters = 64;
     int caret_frame_counter = 0;
     std::string edit_buffer;
+    bool drag_text_editing = false;
+    // Drag-mode text editing starts with the complete numeric token selected.
+    // The first typed character replaces the old value, matching native numeric
+    // field behavior without introducing a full caret/selection subsystem.
+    bool drag_text_select_all = false;
+    // Shared caret/selection state for every editable input mode.  The same
+    // state is used by instant text/numeric inputs and by drag inputs while
+    // they are in double-click text-edit mode.
+    std::size_t text_caret = 0;
+    std::size_t text_anchor = 0;
+    std::size_t text_selection_start = 0;
+    std::size_t text_selection_end = 0;
+    bool text_mouse_selecting = false;
+    double last_drag_click_time = -1.0;
+    Vector2 last_drag_click_position = {0.0f,0.0f};
+    int last_drag_click_component = -1;
+
+    // Captions displayed beside vector/color components. Vector inputs default
+    // to X/Y/Z/W while color inputs default to R/G/B/A.
+    std::array<std::string,4> component_labels = []() {
+        if constexpr(std::is_same_v<T,Color>) {
+            return std::array<std::string,4>{"R","G","B","A"};
+        }
+        else {
+            return std::array<std::string,4>{"X","Y","Z","W"};
+        }
+    }();
+    bool show_component_labels = true;
+    InputLabelLayout component_label_layout = InputLabelLayout::Back;
 
     std::array<std::string,4> component_buffers;
     int active_component = -1;
@@ -1709,10 +2601,43 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
 
     // Fluent configuration.
     UIInput<T>& Text(std::string value) { text = std::move(value); return *this; }
+    UIInput<T>& Label(std::string value) { text = std::move(value); return *this; }
+    UIInput<T>& ShowLabel(bool show = true) { show_label = show; return *this; }
+    UIInput<T>& LabelLayout(InputLabelLayout value) {
+        label_layout = value;
+        component_label_layout = value;
+        return *this;
+    }
     UIInput<T>& Placeholder(std::string value) { placeholder = std::move(value); return *this; }
     UIInput<T>& Id(std::string value) { style.id = std::move(value); return *this; }
     UIInput<T>& Type(InputType value) { input_type = value; return *this; }
-    UIInput<T>& Value(T value_) { value = std::move(value_); return *this; }
+    UIInput<T>& Value(T value_) {
+        value = std::move(value_);
+        if(bound_value != nullptr) {
+            *bound_value = value;
+            pending_explicit_value = false;
+        }
+        else {
+            pending_explicit_value = true;
+        }
+        return *this;
+    }
+    UIInput<T>& Bind(T* value_pointer) {
+        bound_value = value_pointer;
+        if(bound_value != nullptr) {
+            if(pending_explicit_value) {
+                *bound_value = value;
+            }
+            else {
+                value = *bound_value;
+            }
+        }
+        pending_explicit_value = false;
+        return *this;
+    }
+    UIInput<T>& Bind(T& value_reference) { return Bind(&value_reference); }
+    UIInput<T>& Unbind() { bound_value = nullptr; return *this; }
+    bool IsBound() const { return bound_value != nullptr; }
     UIInput<T>& Range(T minimum, T maximum) { min = minimum; max = maximum; return *this; }
     UIInput<T>& Step(T value) { step = value; return *this; }
     UIInput<T>& StepButtons(
@@ -1730,8 +2655,36 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
         slider_value_width = width;
         return *this;
     }
+    UIInput<T>& SliderOrientation(UISliderOrientation value) {
+        slider_orientation = value;
+        return *this;
+    }
     UIInput<T>& SliderClickToSet(bool value = true) { slider_click_to_set = value; return *this; }
     UIInput<T>& MaxCharacters(std::size_t value) { max_characters = value; return *this; }
+    UIInput<T>& ComponentLabels(std::array<std::string,4> labels) {
+        component_labels = std::move(labels);
+        return *this;
+    }
+    UIInput<T>& ComponentLabel(std::size_t index, std::string value) {
+        if(index < component_labels.size()) component_labels[index] = std::move(value);
+        return *this;
+    }
+    UIInput<T>& XLabel(std::string value) { return ComponentLabel(0,std::move(value)); }
+    UIInput<T>& YLabel(std::string value) { return ComponentLabel(1,std::move(value)); }
+    UIInput<T>& ZLabel(std::string value) { return ComponentLabel(2,std::move(value)); }
+    UIInput<T>& WLabel(std::string value) { return ComponentLabel(3,std::move(value)); }
+    UIInput<T>& RLabel(std::string value) { return ComponentLabel(0,std::move(value)); }
+    UIInput<T>& GLabel(std::string value) { return ComponentLabel(1,std::move(value)); }
+    UIInput<T>& BLabel(std::string value) { return ComponentLabel(2,std::move(value)); }
+    UIInput<T>& ALabel(std::string value) { return ComponentLabel(3,std::move(value)); }
+    UIInput<T>& ShowComponentLabels(bool show = true) {
+        show_component_labels = show;
+        return *this;
+    }
+    UIInput<T>& ComponentLabelLayout(InputLabelLayout value) {
+        component_label_layout = value;
+        return *this;
+    }
     UIInput<T>& Disabled(bool value = true) { disabled = value; return *this; }
     UIInput<T>& Tooltip(std::string value) { rect.tooltip = std::move(value); return *this; }
     UIInput<T>& OnChange(std::function<void(UIInput<T>&)> callback) {
@@ -1746,7 +2699,8 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
 
     UIInput(InputType type, T initial_value)
         : input_type(type),
-          value(initial_value) {}
+          value(initial_value),
+          pending_explicit_value(true) {}
 
     UIInput(
         InputType type,
@@ -1757,7 +2711,8 @@ struct UIInput : UIStyleFluent<UIInput<T>> {
         : input_type(type),
           value(initial_value),
           min(minimum),
-          max(maximum) {}
+          max(maximum),
+          pending_explicit_value(true) {}
 };
 
 //--------------------------------------------------------------------
@@ -1773,10 +2728,20 @@ struct UIMenu;
 struct UIPopup;
 struct UIWindow;
 struct UITabBar;
+class UIViewport;
+class UIViewportItem;
 struct UIReconcileOptions;
+struct UIComponentDescriptor;
+class UIComponentRegistry;
 
 class IUICustomElement {
 public:
+    using GenericEventHandler = std::function<void(
+        IUICustomElement&,
+        const std::string&,
+        const std::string&
+    )>;
+
     UIElementBase rect;
     ComputedStyle style;
     // Invalidates callbacks retained by global interaction systems when this
@@ -1795,10 +2760,119 @@ public:
     virtual void Draw(const StyleSheet& style_sheet) = 0;
     virtual bool Focusable() const { return false; }
     virtual bool* FocusFlag() { return nullptr; }
+    // Custom 0.8 components can expose a retained child container without
+    // implementing their own RXML child plumbing. Leaf components keep null.
+    virtual UIContainer* ChildContainer() { return nullptr; }
+    virtual const UIContainer* ChildContainer() const { return nullptr; }
+
+    void SetGenericEventHandler(std::string event_name, GenericEventHandler handler) {
+        generic_event_handlers_[NormalizeUIPseudoStateName(event_name)] = std::move(handler);
+    }
+    bool EmitGenericEvent(std::string event_name,std::string value = {}) {
+        const std::string normalized = NormalizeUIPseudoStateName(event_name);
+        auto found = generic_event_handlers_.find(normalized);
+        if(found == generic_event_handlers_.end() || !found->second) return false;
+        found->second(*this,normalized,value);
+        return true;
+    }
+
     virtual UIElementBase* FindNestedElement(const std::string&) { return nullptr; }
     virtual const UIElementBase* FindNestedElement(const std::string&) const { return nullptr; }
     virtual void ReconcileFrom(IUICustomElement&, const UIReconcileOptions&) {}
     virtual std::string TypeName() const = 0;
+
+private:
+    std::unordered_map<std::string,GenericEventHandler> generic_event_handlers_;
+};
+
+// RUI 0.9 recommended custom-component authoring layer.
+//
+// UIComponent supplies the mechanics shared by normal retained components.
+// Application components generally implement DrawContent() and, only when
+// useful, MeasureContent()/UpdateContent() or the semantic interaction hooks.
+// IUICustomElement remains available for framework-level controls that need to
+// override the complete Measure/Layout/Update/Draw lifecycle.
+class UIComponent : public IUICustomElement {
+public:
+    bool disabled = false;
+
+    UIComponent();
+    ~UIComponent() override = default;
+
+    SelectorType Selector() const final { return selector_; }
+    std::string TypeName() const final { return component_name_; }
+
+    Vector2 Measure(
+        const StyleSheet& style_sheet,
+        float available_width,
+        float available_height
+    ) override;
+    void Layout(const StyleSheet& style_sheet,Rectangle bounds) override;
+    void Update(bool inherited_disabled) override;
+    void Draw(const StyleSheet& style_sheet) override;
+
+    bool Focusable() const override { return focusable_; }
+    bool* FocusFlag() override { return focusable_ ? &focused_ : nullptr; }
+
+    UIContainer* ChildContainer() override;
+    const UIContainer* ChildContainer() const override;
+
+    const UIComponentDescriptor* Descriptor() const { return descriptor_; }
+    bool Hovered() const { return hovered_; }
+    bool Active() const { return active_; }
+    bool Focused() const { return focused_; }
+    bool Dragging() const { return dragging_; }
+    bool HasKeyboardInput() const { return keyboard_input_; }
+
+    // Called by UIComponentRegistry::Create(). Application code normally does
+    // not need to call this. The descriptor pointer is stable after registry
+    // freeze and avoids frame-time string lookups.
+    void AssociateDescriptor(
+        const UIComponentDescriptor* descriptor,
+        const UIComponentRegistry* registry,
+        std::string component_name,
+        SelectorType selector,
+        std::uint32_t capability_bits,
+        bool accepts_visual_children
+    );
+
+protected:
+    virtual Vector2 MeasureContent(float available_width,float available_height) const;
+    virtual void UpdateContent(bool disabled);
+    virtual void DrawContent(const ComputedStyle& style,Rectangle content_bounds);
+
+    virtual void OnClick() {}
+    virtual void OnDragStart(Vector2) {}
+    virtual void OnDrag(Vector2,Vector2) {}
+    virtual void OnDragEnd(Vector2) {}
+
+    Rectangle ContentBounds(const ComputedStyle& resolved_style) const;
+
+private:
+    // Applies descriptor-exposed RCSS properties only for the component draw
+    // pass, then restores semantic/RXML-bound property state afterwards.
+    // Definitions live in rui.cpp where component metadata is complete.
+    void BeginRegisteredStyleOverrides(const ComputedStyle& resolved_style);
+    void EndRegisteredStyleOverrides();
+
+    const UIComponentDescriptor* descriptor_ = nullptr;
+    const UIComponentRegistry* registry_ = nullptr;
+    std::string component_name_ = "UIComponent";
+    SelectorType selector_ = SelectorType::Any;
+    std::uint32_t capability_bits_ = 0;
+    bool focusable_ = false;
+    bool clickable_ = false;
+    bool draggable_ = false;
+    bool keyboard_input_ = false;
+    bool accepts_visual_children_ = false;
+    bool hovered_ = false;
+    bool active_ = false;
+    bool focused_ = false;
+    bool dragging_ = false;
+    Vector2 drag_origin_ = {0.0f,0.0f};
+    Vector2 last_drag_mouse_ = {0.0f,0.0f};
+    std::shared_ptr<UIContainer> children_;
+    std::vector<std::pair<std::string,std::string>> registered_style_backups_;
 };
 
 using UIElement = std::variant<
@@ -1835,7 +2909,10 @@ struct UIContainer : UIStyleFluent<UIContainer> {
 
     LayoutDirection direction = LayoutDirection::Column;
 
-    std::vector<UIElement> elements;
+    // deque keeps references returned by Add()/EmplaceChild()/Row()/Column()/
+    // widget factories stable when later siblings are appended. This is part of
+    // the public retained-tree construction contract.
+    std::deque<UIElement> elements;
 
     bool disabled = false;
     Vector2 scroll = {0.0f,0.0f};
@@ -1875,6 +2952,12 @@ struct UIContainer : UIStyleFluent<UIContainer> {
             std::forward<Arguments>(arguments)...
         );
         Custom& result = *custom;
+        std::string component_class = "__rui-component-";
+        for(unsigned char character : result.TypeName()) {
+            if(std::isspace(character) || character == '-' || character == '_') continue;
+            component_class.push_back(static_cast<char>(std::tolower(character)));
+        }
+        AddCSSClass(result.style.classes,std::move(component_class));
         elements.emplace_back(
             std::static_pointer_cast<IUICustomElement>(std::move(custom))
         );
@@ -1952,6 +3035,108 @@ struct UIContainer : UIStyleFluent<UIContainer> {
         return Add(std::move(button));
     }
 
+    // Programmatic input factories mirror Label()/Button()/Row()/Column().
+    // They return the retained widget itself, so the complete UIInput fluent
+    // surface can be chained immediately. Pointer overloads bind directly to
+    // application state using UIInput<T>::Bind().
+    template <typename T>
+    UIInput<T>& Input(std::string id = {}) {
+        UIInput<T> input;
+        if(!id.empty()) input.style.id = std::move(id);
+        return Add(std::move(input));
+    }
+
+    template <typename T>
+    UIInput<T>& Input(T* binding, std::string id = {}) {
+        UIInput<T>& input = Input<T>(std::move(id));
+        input.Bind(binding);
+        return input;
+    }
+
+    UIInput<float>& FloatInput(std::string id = {}) {
+        return Input<float>(std::move(id));
+    }
+    UIInput<float>& FloatInput(float* binding, std::string id = {}) {
+        return Input<float>(binding,std::move(id));
+    }
+
+    UIInput<int>& IntInput(std::string id = {}) {
+        return Input<int>(std::move(id));
+    }
+    UIInput<int>& IntInput(int* binding, std::string id = {}) {
+        return Input<int>(binding,std::move(id));
+    }
+
+    UIInput<bool>& BoolInput(std::string id = {}) {
+        return Input<bool>(std::move(id));
+    }
+    UIInput<bool>& BoolInput(bool* binding, std::string id = {}) {
+        return Input<bool>(binding,std::move(id));
+    }
+
+    UIInput<std::string>& StringInput(std::string id = {}) {
+        return Input<std::string>(std::move(id));
+    }
+    UIInput<std::string>& StringInput(std::string* binding, std::string id = {}) {
+        return Input<std::string>(binding,std::move(id));
+    }
+
+    UIInput<Vector2>& Vector2Input(std::string id = {}) {
+        return Input<Vector2>(std::move(id));
+    }
+    UIInput<Vector2>& Vector2Input(Vector2* binding, std::string id = {}) {
+        return Input<Vector2>(binding,std::move(id));
+    }
+
+    UIInput<Vector3>& Vector3Input(std::string id = {}) {
+        return Input<Vector3>(std::move(id));
+    }
+    UIInput<Vector3>& Vector3Input(Vector3* binding, std::string id = {}) {
+        return Input<Vector3>(binding,std::move(id));
+    }
+
+    UIInput<Vector4>& Vector4Input(std::string id = {}) {
+        return Input<Vector4>(std::move(id));
+    }
+    UIInput<Vector4>& Vector4Input(Vector4* binding, std::string id = {}) {
+        return Input<Vector4>(binding,std::move(id));
+    }
+
+    UIInput<Color>& ColorInput(std::string id = {}) {
+        return Input<Color>(std::move(id));
+    }
+    UIInput<Color>& ColorInput(Color* binding, std::string id = {}) {
+        return Input<Color>(binding,std::move(id));
+    }
+
+    template <typename T>
+    UIRangeInput<T>& RangeInput(std::string id = {}) {
+        UIRangeInput<T> input;
+        if(!id.empty()) input.style.id = std::move(id);
+        return Add(std::move(input));
+    }
+
+    UIRangeInput<float>& FloatRangeInput(std::string id = {}) {
+        return RangeInput<float>(std::move(id));
+    }
+
+    UIRangeInput<int>& IntRangeInput(std::string id = {}) {
+        return RangeInput<int>(std::move(id));
+    }
+
+    UIComboBox& ComboBox(std::string id = {}) {
+        UIComboBox combo_box;
+        if(!id.empty()) combo_box.style.id = std::move(id);
+        return Add(std::move(combo_box));
+    }
+
+    UISelectable& Selectable(std::string text = "Selectable", std::string id = {}) {
+        UISelectable selectable;
+        selectable.text = std::move(text);
+        if(!id.empty()) selectable.style.id = std::move(id);
+        return Add(std::move(selectable));
+    }
+
     template <typename T>
     UIInput<T>& LabeledInput(
         std::string label_text,
@@ -2022,6 +3207,10 @@ public:
     bool submitted = false;
     std::size_t max_characters = 65536;
     std::size_t caret = 0;
+    std::size_t selection_anchor = 0;
+    std::size_t selection_start = 0;
+    std::size_t selection_end = 0;
+    bool mouse_selecting = false;
     float scroll_y = 0.0f;
     float line_spacing = 2.0f;
     UITextAnimation text_animation;
@@ -2134,7 +3323,24 @@ private:
 
 class UIVirtualList final : public IUICustomElement, public UIStyleFluent<UIVirtualList> {
 public:
+    using BuildVisibleItems = std::function<void(
+        UIVirtualList&,
+        UIContainer&,
+        std::size_t,
+        std::size_t
+    )>;
+
+    // Legacy string-list storage. This remains the source when no virtual
+    // template builder is installed.
     std::vector<std::string> items;
+
+    // Templated mode stores only the number of source records here. The RXML
+    // runtime keeps the actual UIX bindings in the builder callback and creates
+    // controls only for VisibleItems().
+    std::size_t virtual_item_count = 0;
+    UIContainer content;
+    BuildVisibleItems build_visible_items;
+
     float item_height = 28.0f;
     float scroll_y = 0.0f;
     std::size_t overscan = 2;
@@ -2152,16 +3358,28 @@ public:
     void Draw(const StyleSheet&) override;
     bool Focusable() const override { return !disabled; }
     bool* FocusFlag() override { return &focused_; }
+    UIElementBase* FindNestedElement(const std::string&) override;
+    const UIElementBase* FindNestedElement(const std::string&) const override;
     void ReconcileFrom(IUICustomElement&,const UIReconcileOptions&) override;
 
+    bool UsesTemplate() const { return static_cast<bool>(build_visible_items); }
+    std::size_t ItemCount() const {
+        return UsesTemplate() ? virtual_item_count : items.size();
+    }
     UIVisibleRange VisibleItems() const;
     UIVirtualList& Items(std::vector<std::string> values);
+    UIVirtualList& VirtualItems(std::size_t count, BuildVisibleItems builder);
     UIVirtualList& ItemHeight(float value);
     UIVirtualList& Overscan(std::size_t value);
     UIVirtualList& OnSelect(std::function<void(UIVirtualList&,std::size_t)> callback);
 
 private:
+    void RebuildVisibleContent(std::size_t first, std::size_t last);
+
     bool focused_ = false;
+    bool built_range_valid_ = false;
+    std::size_t built_first_ = 0;
+    std::size_t built_last_ = 0;
 };
 
 enum class UIDockAxis { Horizontal, Vertical };
@@ -2195,6 +3413,155 @@ struct UIDockPanel {
     UIContainer content;
 };
 
+struct UIViewportCamera {
+    Vector2 pan = {0.0f,0.0f};
+    float zoom = 1.0f;
+    float min_zoom = 0.1f;
+    float max_zoom = 4.0f;
+};
+
+struct UIViewportDrawEvent {
+    Rectangle screen_bounds{};
+    Rectangle visible_world_bounds{};
+    Vector2 local_mouse{};
+    Vector2 world_mouse{};
+    Vector2 pan{};
+    float zoom = 1.0f;
+};
+
+using UIViewportUpdateCallback = std::function<void(UIViewport&)>;
+using UIViewportDrawCallback = std::function<void(const UIViewport&,const UIViewportDrawEvent&)>;
+using UIViewportViewChangedCallback = std::function<void(UIViewport&,const UIViewportCamera&)>;
+
+class UIViewportItem final : public IUICustomElement, public UIStyleFluent<UIViewportItem> {
+public:
+    UIContainer content;
+    Vector2 position{};
+    int z_index = 0;
+    bool z_order_changed = false;
+    bool visible = true;
+    bool interactive = true;
+    bool disabled = false;
+    bool laid_out = false;
+    Vector2 layout_origin{};
+    // RXML installs this for live world-position bindings without rebuilding.
+    std::function<void(UIViewportItem&)> sync_bindings;
+
+    SelectorType Selector() const override { return SelectorType::ViewportItem; }
+    std::string TypeName() const override { return "ViewportItem"; }
+    Vector2 Measure(const StyleSheet&,float,float) override;
+    void Layout(const StyleSheet&,Rectangle) override;
+    void Update(bool inherited_disabled) override;
+    void Draw(const StyleSheet&) override;
+    bool Focusable() const override { return false; }
+    UIElementBase* FindNestedElement(const std::string&) override;
+    const UIElementBase* FindNestedElement(const std::string&) const override;
+    void ReconcileFrom(IUICustomElement&,const UIReconcileOptions&) override;
+
+    void SetPosition(Vector2 value);
+    void SetZIndex(int value) {
+        if(z_index==value) return;
+        z_index=value;
+        z_order_changed=true;
+    }
+    UIViewportItem& Position(Vector2 value) { SetPosition(value); return *this; }
+    UIViewportItem& ZIndex(int value) { SetZIndex(value); return *this; }
+    UIViewportItem& Visible(bool value=true) { visible=value; return *this; }
+    UIViewportItem& Interactive(bool value=true) { interactive=value; return *this; }
+    UIViewportItem& Disabled(bool value=true) { disabled=value; return *this; }
+    template <typename Widget>
+    UIViewportItem& Add(Widget widget) { content.Add(std::move(widget)); return *this; }
+};
+
+class UIViewport final : public IUICustomElement, public UIStyleFluent<UIViewport> {
+public:
+    UIContainer content;
+    UIViewportCamera camera;
+    // Transform of the UI tree containing this Viewport. Cached during update
+    // and draw so coordinate conversion remains well-defined for nesting.
+    UITransformContext parent_transform{};
+
+    bool clip = true;
+    bool focusable = true;
+    bool disabled = false;
+    bool hovered = false;
+    bool focused = false;
+    bool panning = false;
+    bool pan_enabled = true;
+    bool wheel_zoom = true;
+    int pan_button = MOUSE_BUTTON_MIDDLE;
+    float zoom_speed = 0.12f;
+
+    Vector2 local_mouse{};
+    Vector2 local_mouse_delta{};
+    Vector2 world_mouse{};
+    Vector2 world_mouse_delta{};
+    float wheel = 0.0f;
+
+    UIViewportUpdateCallback on_update;
+    UIViewportDrawCallback on_background_draw;
+    UIViewportDrawCallback on_foreground_draw;
+    UIViewportViewChangedCallback on_view_changed;
+    // RXML installs this to keep pan/zoom bindings live in both directions
+    // without forcing reconciliation or a markup rebuild.
+    std::function<void(UIViewport&)> sync_bindings;
+
+    SelectorType Selector() const override { return SelectorType::Viewport; }
+    std::string TypeName() const override { return "Viewport"; }
+    Vector2 Measure(const StyleSheet&,float,float) override;
+    void Layout(const StyleSheet&,Rectangle) override;
+    void Update(bool inherited_disabled) override;
+    void Draw(const StyleSheet&) override;
+    bool Focusable() const override { return focusable; }
+    bool* FocusFlag() override { return &focused; }
+    UIElementBase* FindNestedElement(const std::string&) override;
+    const UIElementBase* FindNestedElement(const std::string&) const override;
+    void ReconcileFrom(IUICustomElement&,const UIReconcileOptions&) override;
+
+    Vector2 WorldToLocal(Vector2 world) const;
+    Vector2 LocalToWorld(Vector2 local) const;
+    Vector2 WorldToScreen(Vector2 world) const;
+    Vector2 ScreenToWorld(Vector2 screen) const;
+    Rectangle WorldToScreen(Rectangle world) const;
+    Rectangle ScreenToWorld(Rectangle screen) const;
+    Rectangle VisibleWorldRect() const;
+
+    void SetPan(Vector2 pan);
+    void PanBy(Vector2 delta);
+    void SetZoom(float zoom);
+    void ZoomAt(Vector2 parent_position,float zoom);
+    void CenterOn(Vector2 world_position);
+    void Frame(Rectangle world_bounds,float padding=32.0f);
+    void FrameAll(float padding=32.0f);
+    void ResetView();
+
+    UIViewport& Pan(Vector2 value) { SetPan(value); return *this; }
+    UIViewport& Zoom(float value) { SetZoom(value); return *this; }
+    UIViewport& ZoomRange(float minimum,float maximum) {
+        camera.min_zoom=std::max(0.0001f,minimum);
+        camera.max_zoom=std::max(camera.min_zoom,maximum);
+        SetZoom(camera.zoom);
+        return *this;
+    }
+    UIViewport& PanEnabled(bool value=true) { pan_enabled=value; return *this; }
+    UIViewport& PanButton(int value) { pan_button=value; return *this; }
+    UIViewport& WheelZoom(bool value=true) { wheel_zoom=value; return *this; }
+    UIViewport& ZoomSpeed(float value) { zoom_speed=std::max(0.001f,value); return *this; }
+    UIViewport& Clip(bool value=true) { clip=value; return *this; }
+    UIViewport& FocusableValue(bool value=true) { focusable=value; return *this; }
+    UIViewport& Disabled(bool value=true) { disabled=value; return *this; }
+    UIViewport& OnUpdate(UIViewportUpdateCallback callback) { on_update=std::move(callback); return *this; }
+    UIViewport& OnBackgroundDraw(UIViewportDrawCallback callback) { on_background_draw=std::move(callback); return *this; }
+    UIViewport& OnForegroundDraw(UIViewportDrawCallback callback) { on_foreground_draw=std::move(callback); return *this; }
+    UIViewport& OnViewChanged(UIViewportViewChangedCallback callback) { on_view_changed=std::move(callback); return *this; }
+    UIViewportItem& AddItem(std::string id={},Vector2 position={});
+    UIViewportItem* FindItem(const std::string& id);
+    const UIViewportItem* FindItem(const std::string& id) const;
+    bool RemoveItem(const std::string& id);
+    bool BringToFront(const std::string& id);
+    void SortItemsByZ();
+};
+
 class UIDockSpace final : public IUICustomElement, public UIStyleFluent<UIDockSpace> {
 public:
     std::vector<UIDockPanel> panels;
@@ -2207,7 +3574,17 @@ public:
     std::string dragging_panel;
     std::function<void(UIDockSpace&)> on_layout_changed;
 
+    // Optional declarative persistence used by <DockLayout> and DockSpace
+    // persistence attributes in RXML.
+    std::string layout_file;
+    std::string layout_id = "default";
+    bool persist_layout = false;
+    bool restore_layout_on_load = true;
+    bool save_layout_on_change = true;
+    bool save_layout_on_exit = true;
+
     UIDockSpace();
+    ~UIDockSpace() override;
     SelectorType Selector() const override { return SelectorType::DockSpace; }
     std::string TypeName() const override { return "DockSpace"; }
     Vector2 Measure(const StyleSheet&,float,float) override;
@@ -2233,6 +3610,9 @@ public:
     const UIDockNode* FindNode(std::uint64_t id) const;
     std::string SerializeLayout() const;
     bool DeserializeLayout(const std::string& text);
+    bool SaveLayoutFile() const;
+    bool LoadLayoutFile();
+    void NotifyLayoutChanged();
     void NormalizeLayout();
 
 private:
@@ -2242,6 +3622,7 @@ private:
     std::uint64_t resizing_node_ = 0;
     float resize_start_ratio_ = 0.5f;
     Vector2 resize_origin_ = {};
+    bool layout_dirty_ = false;
 };
 
 struct UITab {
@@ -2619,9 +4000,10 @@ struct UI {
     bool LoadFont(
         const std::string& name,
         const std::string& path,
-        int base_size = 32
+        int base_size = 32,
+        const std::vector<int>& codepoints = {}
     ) {
-        return AddUIFont(fonts,name,path,base_size);
+        return AddUIFont(fonts,name,path,base_size,codepoints);
     }
 
     void ActivateFonts() const {
@@ -2908,6 +4290,18 @@ inline void VisitRuntimeElements(
                     target.rect = &widget->rect;
                     target.style = &widget->style;
                     target.selector = widget->Selector();
+                    if(auto* viewport = dynamic_cast<UIViewport*>(widget.get())) {
+                        target.container = &viewport->content;
+                        // Descendants use world coordinates. Keep them available
+                        // to lookup/animation traversal, but out of the root F3
+                        // screen-space layout editor until that editor gains a
+                        // transform-aware target descriptor.
+                        children_visible = false;
+                    }
+                    else if(auto* item = dynamic_cast<UIViewportItem*>(widget.get())) {
+                        target.container = &item->content;
+                        children_visible = children_visible && item->visible;
+                    }
                 }
                 else if constexpr(std::is_same_v<T,std::shared_ptr<UIContainer>>) {
                     if(!widget) return;
@@ -3038,31 +4432,43 @@ void MarkLayoutDirty(
     bool recursive
 );
 
-//--------------------------------------------------------------------
-// CSS ID utilities
-//--------------------------------------------------------------------
 
-bool HasCSSId(const CSS_Id& id);
+// Convert the RCSS/C++ border-radius representation to a physical pixel
+// radius or to raylib's normalized DrawRectangleRounded() roundness.
+//
+//   0..1   -> legacy normalized roundness (backward compatible)
+//   < 0    -> RCSS pixel radius encoded by the parser (e.g. 10px -> -10)
+//   > 1    -> pixel radius (convenient for the C++ fluent API)
+inline float ResolveUIBorderRadiusPixels(Rectangle rectangle, float radius) {
+    const float min_side = std::min(rectangle.width,rectangle.height);
+    if(min_side <= 0.0f || radius == 0.0f) return 0.0f;
 
-bool HasCSSClass(const std::vector<std::string>& classes, const std::string& class_name);
+    const float maximum = min_side*0.5f;
+    if(radius < 0.0f) return std::clamp(-radius,0.0f,maximum);
+    if(radius <= 1.0f) return maximum*std::clamp(radius,0.0f,1.0f);
+    return std::clamp(radius,0.0f,maximum);
+}
 
-void AddCSSClass(std::vector<std::string>& classes, const std::string& class_name);
+inline float ResolveUIBorderRoundness(Rectangle rectangle, float radius) {
+    const float min_side = std::min(rectangle.width,rectangle.height);
+    if(min_side <= 0.0f) return 0.0f;
+    return std::clamp(
+        (ResolveUIBorderRadiusPixels(rectangle,radius)*2.0f)/min_side,
+        0.0f,
+        1.0f
+    );
+}
 
-bool RemoveCSSClass(std::vector<std::string>& classes, const std::string& class_name);
-
-bool ToggleCSSClass(std::vector<std::string>& classes, const std::string& class_name);
-
-void ClearCSSClasses(std::vector<std::string>& classes);
-
-Color WithOpacity(Color color, float opacity);
-
-Color MixColors(Color first, Color second, float amount);
-
-Color LightenColor(Color color, float amount);
-
-Color DarkenColor(Color color, float amount);
-
-Color ApplyStyleOpacity(Color color, float opacity);
+// Effective CSS widths are returned as left/right/top/bottom fields.
+// A legacy scalar-only style is treated as a uniform border.
+EdgeValues EffectiveBorderWidths(const ComputedStyle& style);
+float MaximumBorderWidth(const ComputedStyle& style);
+void DrawStyleBorder(
+    Rectangle rectangle,
+    const ComputedStyle& style,
+    Color color,
+    int segments = 8
+);
 
 float GetTextX(Rectangle content, float text_width, TextAlign alignment);
 
@@ -3076,7 +4482,13 @@ bool SelectorMatches(
     SelectorType selector_type,
     const CSS_Id& id,
     const std::vector<std::string>& classes,
-    SelectorState selector_state
+    SelectorState selector_state,
+    const std::vector<StyleSelector>& ancestors = {},
+    const std::vector<StyleSelectorSiblingChain>&
+        ancestor_previous_siblings = {},
+    StyleSelectorSiblingChain previous_siblings = {},
+    std::size_t sibling_index = 0,
+    std::size_t sibling_count = 0
 );
 
 int GetSelectorSpecificity(const StyleRule& rule);
@@ -3096,36 +4508,27 @@ inline std::optional<T> ResolveValue(
 ) {
     std::optional<T> value;
     int best_specificity = -1;
-
-    for(const auto& style_rule : style_sheet.rules) {
-        if(!SelectorMatches(style_rule, selector_type, id, classes, selector_state)) {
-            continue;
-        }
-
-        int specificity = GetSelectorSpecificity(style_rule);
-
+    const std::size_t selector_index = static_cast<std::size_t>(selector_type);
+    const auto apply_rule = [&](const StyleRule& style_rule) {
+        if(!SelectorMatches(style_rule,selector_type,id,classes,selector_state)) return;
+        const int specificity = style_rule.specificity;
         for(const auto& declaration : style_rule.declarations) {
-            if(declaration.property != property_type) {
-                continue;
-            }
-
-            if(!std::holds_alternative<T>(declaration.value)) {
-                TraceLog(
-                    LOG_WARNING,
-                    "Selector has invalid value type %s for property %s",
-                    IndexToString(declaration.value.index(), value_type_names),
-                    EnumToString(property_type, property_names)
-                );
-                continue;
-            }
-
+            if(declaration.property != property_type) continue;
+            if(!std::holds_alternative<T>(declaration.value)) continue;
             if(specificity >= best_specificity) {
                 value = std::get<T>(declaration.value);
                 best_specificity = specificity;
             }
         }
+    };
+    if(selector_index < style_sheet.rules_by_selector.size()) {
+        for(std::size_t index : style_sheet.rules_by_selector[selector_index]) {
+            apply_rule(style_sheet.rules[index]);
+        }
     }
-
+    else {
+        for(const StyleRule& rule : style_sheet.rules) apply_rule(rule);
+    }
     return value;
 }
 
@@ -3140,7 +4543,10 @@ std::optional<CSSLength> ResolveLengthValue(
 
 float ResolveCSSLength(
     const CSSLength& length,
-    float percent_reference
+    float percent_reference,
+    float font_size = 16.0f,
+    float root_font_size = 16.0f,
+    const UIStyleVariableMap* variables = nullptr
 );
 
 float ComputedMetricScale(
@@ -3168,11 +4574,52 @@ void ApplyComputedStyleScale(
 
 float EffectiveComputedStyleScale(const ComputedStyle& style);
 
+// Modern RCSS paint/effect helpers. These remain no-ops on ordinary styles.
+bool RequiresUICompositing(const ComputedStyle& style);
+float UIEffectExpansion(const ComputedStyle& style, const Rectangle& element_bounds);
+Rectangle ExpandUIPaintBounds(const Rectangle& bounds, const ComputedStyle& style);
+void ClearUIEffectResources();
+// Captures and composites only when the style requires it. Returns true when
+// the callback was rendered through an offscreen effect layer. On the normal
+// fast path it returns false without invoking the callback.
+bool DrawUICompositedLayer(
+    UIElementBase& owner,
+    const ComputedStyle& style,
+    Rectangle paint_bounds,
+    const std::function<void()>& draw_subtree
+);
+
+bool StyleMayUseGeneratedPseudo(
+    const StyleSheet& style_sheet,
+    SelectorType selector,
+    const ComputedStyle& owner_style,
+    UIGeneratedPseudoKind kind
+);
+bool StyleMayUseCompositing(
+    const StyleSheet& style_sheet,
+    SelectorType selector,
+    const ComputedStyle& style
+);
+const ComputedStyle* ResolveGeneratedPseudoStyleRef(
+    UIElementBase& owner,
+    const ComputedStyle& owner_style,
+    SelectorType selector,
+    const StyleSheet& style_sheet,
+    UIGeneratedPseudoKind kind
+);
+void DrawGeneratedPseudoElement(
+    UIElementBase& owner,
+    const ComputedStyle& owner_style,
+    SelectorType selector,
+    const StyleSheet& style_sheet,
+    UIGeneratedPseudoKind kind
+);
+
 void ResolveComputedLengths(
     ComputedStyle& style,
     float parent_width,
     float parent_height,
-    float parent_font_size = 20.0f,
+    float parent_font_size = 16.0f,
     float inherited_scale = 1.0f,
     bool relative_reference_includes_local_scale = false
 );
@@ -3206,6 +4653,14 @@ ComputedStyle ResolveStyleWithPseudoStates(
     ComputedStyle style = {}
 );
 
+const ComputedStyle& ResolveAnimatedStyleRef(
+    UIElementBase& element,
+    const StyleSheet& style_sheet,
+    const ComputedStyle& target_style,
+    const std::string& channel = {},
+    std::size_t target_revision = 0
+);
+
 ComputedStyle ResolveAnimatedStyle(
     UIElementBase& element,
     const StyleSheet& style_sheet,
@@ -3221,6 +4676,17 @@ ComputedStyle ResolveLayoutAnimatedStyle(
     UIElementBase& element,
     const StyleSheet& style_sheet,
     ComputedStyle target_style
+);
+
+struct UILayoutFrameActivity {
+    bool pseudo_changed = false;
+    bool animation_active = false;
+};
+
+UILayoutFrameActivity RefreshUILayoutFrameActivity(
+    UIContainer& root,
+    bool update_pseudo_states = true,
+    bool check_layout_animations = true
 );
 bool IsUILayoutAnimationActive(const UIElementBase& element);
 bool HasActiveUILayoutAnimations(const UIContainer& root);
@@ -3355,7 +4821,7 @@ inline bool UpdateTriggerInput(UIInput<T>& input) {
     }
 
     Rectangle rect = input.rect.transform;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetUIMousePosition();
 
     input.hovered = CheckCollisionPointRec(mouse, rect);
 
@@ -3363,7 +4829,7 @@ inline bool UpdateTriggerInput(UIInput<T>& input) {
         CSS_UI_REQUESTED_CURSOR=MOUSE_CURSOR_POINTING_HAND;
     }
 
-    else if(input.hovered &&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+    if(input.hovered &&IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         input.pressed = true;
         input.pressed_inside = true;
         input.focused = true;
@@ -3516,7 +4982,7 @@ inline Rectangle GetInputValueRect(const UIInput<T>& input) {
 template <typename T>
 inline T ClampInputValue(const UIInput<T>& input, T value) {
     if constexpr(SupportsInputStepButtons<T>) {
-        if(input.min <= input.max) {
+        if(input.min < input.max) {
             return std::clamp(value,input.min,input.max);
         }
     }
@@ -3569,18 +5035,56 @@ inline Rectangle GetSliderInteractionRect(const UIInput<T>& input) {
     };
 
     if(input.slider_show_value) {
-        const float reserved = std::min(
-            content.width,
-            std::max(0.0f,input.slider_value_width)
-        );
+        if(input.slider_orientation == UISliderOrientation::Vertical) {
+            const float reserved = std::min(
+                content.height,
+                std::max(0.0f,input.style.font_size + 4.0f)
+            );
 
-        content.width = std::max(
-            0.0f,
-            content.width - reserved - 8.0f
-        );
+            content.height = std::max(
+                0.0f,
+                content.height - reserved - 8.0f
+            );
+        }
+        else {
+            const float reserved = std::min(
+                content.width,
+                std::max(0.0f,input.slider_value_width)
+            );
+
+            content.width = std::max(
+                0.0f,
+                content.width - reserved - 8.0f
+            );
+        }
     }
 
     return content;
+}
+
+template <typename T>
+inline float GetSliderNormalizedFromPoint(
+    const UIInput<T>& input,
+    Rectangle slider_rect,
+    Vector2 point
+) {
+    if(input.slider_orientation == UISliderOrientation::Vertical) {
+        if(slider_rect.height <= 0.0f) return 0.0f;
+
+        return 1.0f - std::clamp(
+            (point.y-slider_rect.y) / slider_rect.height,
+            0.0f,
+            1.0f
+        );
+    }
+
+    if(slider_rect.width <= 0.0f) return 0.0f;
+
+    return std::clamp(
+        (point.x-slider_rect.x) / slider_rect.width,
+        0.0f,
+        1.0f
+    );
 }
 
 template <typename T>
@@ -3667,7 +5171,7 @@ inline bool UpdateInputStepButtons(UIInput<T>& input) {
             return false;
         }
 
-        Vector2 mouse = GetMousePosition();
+        Vector2 mouse = GetUIMousePosition();
         Rectangle increment = GetInputIncrementRect(input,input.step_button_layout);
         Rectangle decrement = GetInputDecrementRect(input,input.step_button_layout);
         input.decrement_hovered =
@@ -3732,6 +5236,341 @@ template <>
 inline constexpr int VectorComponentCount<Vector4> = 4;
 
 template <typename T>
+inline bool RegisterDragInputClick(
+    UIInput<T>& input,
+    Vector2 position,
+    int component = -1
+) {
+    constexpr double kDoubleClickSeconds = 0.30;
+    constexpr float kDoubleClickDistance = 5.0f;
+
+    const double now = GetTime();
+    const float dx = position.x-input.last_drag_click_position.x;
+    const float dy = position.y-input.last_drag_click_position.y;
+    const bool same_component = component == input.last_drag_click_component;
+    const bool close_enough =
+        dx*dx+dy*dy <= kDoubleClickDistance*kDoubleClickDistance;
+    const bool double_click =
+        input.last_drag_click_time >= 0.0 &&
+        now-input.last_drag_click_time <= kDoubleClickSeconds &&
+        same_component &&
+        close_enough;
+
+    // Consume the completed pair so a triple click does not immediately
+    // start another edit session.
+    input.last_drag_click_time = double_click ? -1.0 : now;
+    input.last_drag_click_position = position;
+    input.last_drag_click_component = component;
+    return double_click;
+}
+
+template <typename T>
+inline bool UIInputHasTextSelection(const UIInput<T>& input) {
+    return input.text_selection_end > input.text_selection_start;
+}
+
+template <typename T>
+inline void UIInputNormalizeTextSelection(UIInput<T>& input, std::size_t size) {
+    input.text_caret = std::min(input.text_caret,size);
+    input.text_anchor = std::min(input.text_anchor,size);
+    input.text_selection_start = std::min(input.text_anchor,input.text_caret);
+    input.text_selection_end = std::max(input.text_anchor,input.text_caret);
+    input.drag_text_select_all =
+        input.text_selection_start == 0 &&
+        input.text_selection_end == size &&
+        size > 0;
+}
+
+template <typename T>
+inline void UIInputCollapseTextSelection(UIInput<T>& input, std::size_t caret) {
+    input.text_caret = caret;
+    input.text_anchor = caret;
+    input.text_selection_start = caret;
+    input.text_selection_end = caret;
+    input.drag_text_select_all = false;
+}
+
+template <typename T>
+inline void UIInputSelectAllText(UIInput<T>& input, const std::string& buffer) {
+    input.text_anchor = 0;
+    input.text_caret = buffer.size();
+    input.text_selection_start = 0;
+    input.text_selection_end = buffer.size();
+    input.drag_text_select_all = !buffer.empty();
+    input.caret_frame_counter = 0;
+}
+
+template <typename T>
+inline bool UIInputDeleteTextSelection(UIInput<T>& input, std::string& buffer) {
+    UIInputNormalizeTextSelection(input,buffer.size());
+    if(!UIInputHasTextSelection(input)) return false;
+    const std::size_t start = input.text_selection_start;
+    buffer.erase(start,input.text_selection_end-start);
+    UIInputCollapseTextSelection(input,start);
+    input.caret_frame_counter = 0;
+    return true;
+}
+template <typename T>
+inline bool UIInputCopyTextSelection(UIInput<T>& input, std::string& buffer) {
+    UIInputNormalizeTextSelection(input, buffer.size());
+    if (!UIInputHasTextSelection(input)) return false;
+
+    const std::size_t start = input.text_selection_start;
+    const std::size_t length = input.text_selection_end - start;
+
+    SetClipboardText(buffer.substr(start, length).c_str());
+
+    return true;
+}
+
+inline float UIInputMeasureTextPrefix(
+    Font font,
+    const std::string& text,
+    std::size_t count,
+    float font_size
+) {
+    count = std::min(count,text.size());
+    if(count == 0) return 0.0f;
+    return MeasureTextEx(
+        font,
+        text.substr(0,count).c_str(),
+        font_size,
+        1.0f
+    ).x;
+}
+
+template <typename T>
+inline void DrawUIInputTextSelectionAndCaret(
+    UIInput<T>& input,
+    Font font,
+    const std::string& text,
+    Vector2 position,
+    float font_size,
+    Color text_color,
+    bool editing
+) {
+    if(!editing) return;
+    UIInputNormalizeTextSelection(input,text.size());
+    if(UIInputHasTextSelection(input)) {
+        const float start_x = UIInputMeasureTextPrefix(
+            font,text,input.text_selection_start,font_size
+        );
+        const float end_x = UIInputMeasureTextPrefix(
+            font,text,input.text_selection_end,font_size
+        );
+        const UIFontVerticalExtent extent = MeasureFontVerticalExtent(font,font_size);
+        DrawRectangleRec(
+            Rectangle{
+                position.x+start_x-1.0f,
+                position.y+extent.top-1.0f,
+                std::max(2.0f,end_x-start_x+2.0f),
+                extent.Height()+2.0f
+            },
+            Color{80,140,255,110}
+        );
+    }
+
+    constexpr double CARET_BLINK_INTERVAL = 0.53; // seconds per half-cycle
+
+    if(std::fmod(GetTime(), CARET_BLINK_INTERVAL*2.0) < CARET_BLINK_INTERVAL) {
+        const float caret_x = UIInputMeasureTextPrefix(
+            font,text,input.text_caret,font_size
+        );
+        const UIFontVerticalExtent extent = MeasureFontVerticalExtent(font,font_size);
+        DrawLineEx(
+            {position.x+caret_x,position.y+extent.top-1.0f},
+            {position.x+caret_x,position.y+extent.bottom+1.0f},
+            1.5f,
+            text_color
+        );
+    }
+}
+
+inline std::size_t UIInputTextIndexFromMouse(
+    Font font,
+    const std::string& text,
+    float font_size,
+    float text_x,
+    float mouse_x
+) {
+    if(text.empty() || mouse_x <= text_x) return 0;
+    float previous = 0.0f;
+    for(std::size_t index=1; index<=text.size(); ++index) {
+        const float width = UIInputMeasureTextPrefix(font,text,index,font_size);
+        const float midpoint = (previous+width)*0.5f;
+        if(mouse_x-text_x < midpoint) return index-1;
+        previous = width;
+    }
+    return text.size();
+}
+
+template <typename T>
+inline void UIInputSetCaretFromMouse(
+    UIInput<T>& input,
+    const std::string& buffer,
+    Rectangle text_rect,
+    const ComputedStyle& style,
+    float mouse_x,
+    bool extend_selection
+) {
+    Font font = ResolveUIFont(style.font);
+    const float text_width = MeasureTextEx(
+        font,buffer.c_str(),style.font_size,1.0f
+    ).x;
+    float text_x = text_rect.x;
+    if(style.text_align == TextAlign::Center) {
+        text_x += std::max(0.0f,(text_rect.width-text_width)*0.5f);
+    }
+    else if(style.text_align == TextAlign::Right) {
+        text_x += std::max(0.0f,text_rect.width-text_width);
+    }
+    const std::size_t next = UIInputTextIndexFromMouse(
+        font,buffer,style.font_size,text_x,mouse_x
+    );
+    if(!extend_selection) input.text_anchor = next;
+    input.text_caret = next;
+    UIInputNormalizeTextSelection(input,buffer.size());
+    input.caret_frame_counter = 0;
+}
+
+template <typename T>
+inline void UIInputHandleTextNavigation(UIInput<T>& input, std::string& buffer) {
+    const bool control = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if(control && IsKeyPressed(KEY_A)) {
+        UIInputSelectAllText(input,buffer);
+        return;
+    }
+
+    auto move_caret = [&](std::size_t next) {
+        next = std::min(next,buffer.size());
+        if(!shift) input.text_anchor = next;
+        input.text_caret = next;
+        UIInputNormalizeTextSelection(input,buffer.size());
+        input.caret_frame_counter = 0;
+    };
+
+    if(IsKeyPressed(KEY_HOME)) move_caret(0);
+    else if(IsKeyPressed(KEY_END)) move_caret(buffer.size());
+    else if(IsKeyPressed(KEY_LEFT)) {
+        if(!shift && UIInputHasTextSelection(input)) move_caret(input.text_selection_start);
+        else move_caret(input.text_caret > 0 ? input.text_caret-1 : 0);
+    }
+    else if(IsKeyPressed(KEY_RIGHT)) {
+        if(!shift && UIInputHasTextSelection(input)) move_caret(input.text_selection_end);
+        else move_caret(std::min(buffer.size(),input.text_caret+1));
+    }
+}
+
+template <typename T>
+inline void UIInputInsertTextCharacter(
+    UIInput<T>& input,
+    std::string& buffer,
+    char character
+) {
+    UIInputDeleteTextSelection(input,buffer);
+    if(buffer.size() >= input.max_characters) return;
+    const std::size_t caret = std::min(input.text_caret,buffer.size());
+    buffer.insert(buffer.begin()+static_cast<std::ptrdiff_t>(caret),character);
+    UIInputCollapseTextSelection(input,caret+1);
+    input.caret_frame_counter = 0;
+}
+
+template <typename T>
+inline void UIInputBackspaceText(UIInput<T>& input, std::string& buffer) {
+    if(UIInputDeleteTextSelection(input,buffer)) return;
+    if(input.text_caret == 0 || buffer.empty()) return;
+    const std::size_t erase_at = std::min(input.text_caret,buffer.size())-1;
+    buffer.erase(erase_at,1);
+    UIInputCollapseTextSelection(input,erase_at);
+    input.caret_frame_counter = 0;
+}
+
+template <typename T>
+inline void UIInputDeleteText(UIInput<T>& input, std::string& buffer) {
+    if(UIInputDeleteTextSelection(input,buffer)) return;
+    if(input.text_caret >= buffer.size()) return;
+    buffer.erase(input.text_caret,1);
+    UIInputCollapseTextSelection(input,input.text_caret);
+    input.caret_frame_counter = 0;
+}
+template <typename T>
+inline bool UIInputPasteText(UIInput<T>& input, std::string& buffer) {
+    const char* clipboard = GetClipboardText();
+    if (clipboard == nullptr || clipboard[0] == '\0') return false;
+
+    std::string text = clipboard;
+
+    UIInputNormalizeTextSelection(input, buffer.size());
+
+    std::size_t insertion_index = input.text_caret;
+    if (UIInputHasTextSelection(input)) {
+        const std::size_t start = input.text_selection_start;
+        buffer.erase(start, input.text_selection_end - start);
+        UIInputCollapseTextSelection(input, start);
+        insertion_index = start;
+    }
+
+    const std::size_t available =
+        input.max_characters > buffer.size()
+            ? input.max_characters - buffer.size()
+            : 0;
+    if (text.size() > available) {
+        text.resize(available);
+    }
+
+    buffer.insert(insertion_index, text);
+    input.text_caret = insertion_index + text.size();
+    UIInputCollapseTextSelection(input, input.text_caret);
+    input.caret_frame_counter = 0;
+
+    return !text.empty();
+}
+template <typename T>
+inline bool CommitVectorInputTextEdit(UIInput<T>& input) {
+    if(input.active_component < 0) return false;
+
+    std::string& buffer = input.component_buffers[input.active_component];
+    if(buffer.empty() || buffer == "-" || buffer == ".") return false;
+
+    float* value_component = GetVectorComponent(input.value,input.active_component);
+    const float* minimum_component = GetVectorComponent(input.min,input.active_component);
+    const float* maximum_component = GetVectorComponent(input.max,input.active_component);
+    const float* step_component = GetVectorComponent(input.step,input.active_component);
+    if(
+        value_component == nullptr ||
+        minimum_component == nullptr ||
+        maximum_component == nullptr
+    ) return false;
+
+    const float old_value = *value_component;
+    try {
+        float next_value = std::stof(buffer);
+        if(step_component != nullptr && *step_component > 0.0f) {
+            next_value =
+                *minimum_component +
+                std::round(
+                    (next_value-*minimum_component) /
+                    *step_component
+                ) * *step_component;
+        }
+        if(*minimum_component < *maximum_component) {
+            next_value = std::clamp(
+                next_value,*minimum_component,*maximum_component
+            );
+        }
+        *value_component = next_value;
+    }
+    catch(...) {
+        return false;
+    }
+
+    const bool changed = *value_component != old_value;
+    input.changed = input.changed || changed;
+    return changed;
+}
+
+template <typename T>
 inline void UpdateVectorInput(UIInput<T>& input) {
     if(UpdateTriggerInput(input)) {
         return;
@@ -3740,7 +5579,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
     ResetInputFrameState(input);
 
     Rectangle rect = input.rect.transform;
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetUIMousePosition();
 
     input.hovered = CheckCollisionPointRec(mouse,rect);
 
@@ -3798,7 +5637,10 @@ inline void UpdateVectorInput(UIInput<T>& input) {
         hovered_component >= 0
     ) {
         CSS_UI_REQUESTED_CURSOR =
-            MOUSE_CURSOR_RESIZE_EW;
+            input.drag_text_editing &&
+            input.active_component == hovered_component
+                ? MOUSE_CURSOR_IBEAM
+                : MOUSE_CURSOR_RESIZE_EW;
     }
     else if(
         input.input_type == InputType::Slider &&
@@ -3809,50 +5651,126 @@ inline void UpdateVectorInput(UIInput<T>& input) {
     }
 
     if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        const int previous_component = input.active_component;
+        const bool was_drag_text_editing = input.drag_text_editing;
+        const bool drag_double_click =
+            input.input_type == InputType::Drag &&
+            hovered_component >= 0 &&
+            RegisterDragInputClick(input,mouse,hovered_component);
+
+        if(
+            was_drag_text_editing &&
+            (hovered_component < 0 || hovered_component != previous_component)
+        ) {
+            CommitVectorInputTextEdit(input);
+            input.drag_text_editing = false;
+            input.drag_text_select_all = false;
+        }
+
         input.focused = input.hovered;
         input.dragging = false;
 
         if(hovered_component >= 0) {
-            input.active_component =
-                hovered_component;
+            input.active_component = hovered_component;
 
-            float* component =
-                GetVectorComponent(
-                    input.value,
-                    input.active_component
-                );
+            float* component = GetVectorComponent(
+                input.value,input.active_component
+            );
+            if(
+                component != nullptr &&
+                !(
+                    was_drag_text_editing &&
+                    hovered_component == previous_component
+                )
+            ) {
+                input.component_buffers[input.active_component] =
+                    TextFormat("%.2f",*component);
+            }
 
-            if(component != nullptr) {
-                input.component_buffers[
-                    input.active_component
-                ] = TextFormat(
-                    "%.2f",
-                    *component
+            if(drag_double_click) {
+                input.drag_text_editing = true;
+                input.focused = true;
+                input.dragging = false;
+                UIInputSelectAllText(
+                    input,
+                    input.component_buffers[input.active_component]
                 );
+                input.caret_frame_counter = 0;
+            }
+            else if(
+                input.input_type == InputType::Slider ||
+                (
+                    input.input_type == InputType::Drag &&
+                    !input.drag_text_editing
+                )
+            ) {
+                input.dragging = true;
+                input.drag_start_value = input.value;
+                input.drag_accumulator = 0.0f;
             }
 
             if(
-                input.input_type ==
-                    InputType::Slider ||
-                input.input_type ==
-                    InputType::Drag
+                !drag_double_click &&
+                (
+                    input.input_type == InputType::Instant ||
+                    input.drag_text_editing
+                )
             ) {
-                input.dragging = true;
-
-                input.drag_start_value =
-                    input.value;
-
-                input.drag_accumulator =
-                    0.0f;
+                Rectangle component_rect = {
+                    content.x + component_width*static_cast<float>(input.active_component),
+                    content.y,
+                    component_width,
+                    content.height
+                };
+                const bool extend =
+                    IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                UIInputSetCaretFromMouse(
+                    input,
+                    input.component_buffers[input.active_component],
+                    component_rect,
+                    input.style,
+                    mouse.x,
+                    extend
+                );
+                input.text_mouse_selecting = true;
             }
         }
         else {
             input.active_component = -1;
+            if(input.input_type == InputType::Drag) {
+                input.drag_text_editing = false;
+                input.drag_text_select_all = false;
+                input.last_drag_click_time = -1.0;
+            }
         }
     }
 
     if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
         input.dragging = false;
+        input.text_mouse_selecting = false;
+    }
+
+    if(
+        input.text_mouse_selecting &&
+        IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+        input.focused &&
+        input.active_component >= 0 &&
+        (input.input_type == InputType::Instant || input.drag_text_editing)
+    ) {
+        Rectangle component_rect = {
+            content.x + component_width*static_cast<float>(input.active_component),
+            content.y,
+            component_width,
+            content.height
+        };
+        UIInputSetCaretFromMouse(
+            input,
+            input.component_buffers[input.active_component],
+            component_rect,
+            input.style,
+            mouse.x,
+            true
+        );
     }
 
     input.active = input.dragging;
@@ -3885,7 +5803,6 @@ inline void UpdateVectorInput(UIInput<T>& input) {
             0.0f,
             1.0f
         );
-
         float* value_component =
             GetVectorComponent(
                 input.value,
@@ -3960,6 +5877,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
      */
     if(
         input.input_type == InputType::Drag &&
+        !input.drag_text_editing &&
         input.dragging &&
         input.active_component >= 0
     ) {
@@ -4010,7 +5928,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
 
         // Accumulate horizontal mouse movement using the configured drag speed.
         input.drag_accumulator +=
-            GetMouseDelta().x *
+            GetUIMouseDelta().x *
             input.drag_speed *
             modifier;
 
@@ -4044,7 +5962,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
             }
 
             if(
-                *minimum_component <=
+                *minimum_component < 
                 *maximum_component
             ) {
                 next_value = std::clamp(
@@ -4067,6 +5985,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
     if(
         input.hovered &&
         !input.dragging &&
+        !input.drag_text_editing &&
         input.active_component >= 0 &&
         (
             input.input_type ==
@@ -4123,7 +6042,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
                     direction;
 
                 if(
-                    *minimum_component <=
+                    *minimum_component <
                     *maximum_component
                 ) {
                     next_value = std::clamp(
@@ -4146,6 +6065,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
      */
     if(
         input.focused &&
+        !input.drag_text_editing &&
         input.active_component >= 0 &&
         (
             input.input_type ==
@@ -4211,7 +6131,7 @@ inline void UpdateVectorInput(UIInput<T>& input) {
                     );
 
                 if(
-                    *minimum_component <=
+                    *minimum_component <
                     *maximum_component
                 ) {
                     next_value = std::clamp(
@@ -4234,7 +6154,10 @@ inline void UpdateVectorInput(UIInput<T>& input) {
         input.changed &&
         (
             input.input_type == InputType::Slider ||
-            input.input_type == InputType::Drag
+            (
+                input.input_type == InputType::Drag &&
+                !input.drag_text_editing
+            )
         ) &&
         input.active_component >= 0
     ) {
@@ -4255,10 +6178,17 @@ inline void UpdateVectorInput(UIInput<T>& input) {
     }
 
     /*
-     * Instant text editing
+     * Text editing. Instant inputs enter on a normal click; drag inputs enter
+     * only after a double click on the same component.
      */
     if(
-        input.input_type == InputType::Instant &&
+        (
+            input.input_type == InputType::Instant ||
+            (
+                input.input_type == InputType::Drag &&
+                input.drag_text_editing
+            )
+        ) &&
         input.focused &&
         input.active_component >= 0
     ) {
@@ -4267,6 +6197,8 @@ inline void UpdateVectorInput(UIInput<T>& input) {
                 input.active_component
             ];
 
+        UIInputHandleTextNavigation(input,buffer);
+
         int character = GetCharPressed();
 
         while(character > 0) {
@@ -4274,122 +6206,64 @@ inline void UpdateVectorInput(UIInput<T>& input) {
                 character >= '0' &&
                 character <= '9';
 
+            std::string preview = buffer;
+            if(UIInputHasTextSelection(input)) {
+                preview.erase(
+                    input.text_selection_start,
+                    input.text_selection_end-input.text_selection_start
+                );
+            }
+
+            const std::size_t insertion_index = UIInputHasTextSelection(input)
+                ? input.text_selection_start
+                : input.text_caret;
+
             const bool minus =
                 character == '-' &&
-                buffer.empty();
+                preview.empty() &&
+                insertion_index == 0;
 
             const bool decimal =
                 character == '.' &&
-                buffer.find('.') ==
-                    std::string::npos;
+                preview.find('.') == std::string::npos;
 
             if(digit || minus || decimal) {
-                buffer.push_back(
-                    static_cast<char>(
-                        character
-                    )
+                UIInputInsertTextCharacter(
+                    input,buffer,static_cast<char>(character)
                 );
             }
 
             character = GetCharPressed();
         }
 
-        if(
-            IsKeyPressed(KEY_BACKSPACE) &&
-            !buffer.empty()
-        ) {
-            buffer.pop_back();
+        if(IsKeyPressed(KEY_BACKSPACE)) {
+            UIInputBackspaceText(input,buffer);
+        }
+
+        if(IsKeyPressed(KEY_DELETE)) {
+            UIInputDeleteText(input,buffer);
         }
 
         if(IsKeyPressed(KEY_ENTER)) {
-            if(
-                !buffer.empty() &&
-                buffer != "-" &&
-                buffer != "."
-            ) {
-                float* value_component =
-                    GetVectorComponent(
-                        input.value,
-                        input.active_component
-                    );
-
-                const float* minimum_component =
-                    GetVectorComponent(
-                        input.min,
-                        input.active_component
-                    );
-
-                const float* maximum_component =
-                    GetVectorComponent(
-                        input.max,
-                        input.active_component
-                    );
-
-                const float* step_component =
-                    GetVectorComponent(
-                        input.step,
-                        input.active_component
-                    );
-
-                if(
-                    value_component != nullptr &&
-                    minimum_component != nullptr &&
-                    maximum_component != nullptr
-                ) {
-                    const float old_value =
-                        *value_component;
-
-                    try {
-                        float next_value =
-                            std::stof(buffer);
-
-                        if(
-                            step_component != nullptr &&
-                            *step_component > 0.0f
-                        ) {
-                            next_value =
-                                *minimum_component +
-                                std::round(
-                                    (
-                                        next_value -
-                                        *minimum_component
-                                    ) /
-                                    *step_component
-                                ) *
-                                *step_component;
-                        }
-
-                        if(
-                            *minimum_component <=
-                            *maximum_component
-                        ) {
-                            next_value =
-                                std::clamp(
-                                    next_value,
-                                    *minimum_component,
-                                    *maximum_component
-                                );
-                        }
-
-                        *value_component =
-                            next_value;
-
-                        input.changed =
-                            *value_component !=
-                            old_value;
-                    }
-                    catch(...) {
-                    }
-                }
-            }
-
+            CommitVectorInputTextEdit(input);
+            input.submitted = true;
             input.focused = false;
+            input.drag_text_editing = false;
+            input.drag_text_select_all = false;
+            input.text_mouse_selecting = false;
+            UIInputCollapseTextSelection(input,0);
+            input.last_drag_click_time = -1.0;
             input.active_component = -1;
             buffer.clear();
         }
 
         if(IsKeyPressed(KEY_ESCAPE)) {
             input.focused = false;
+            input.drag_text_editing = false;
+            input.drag_text_select_all = false;
+            input.text_mouse_selecting = false;
+            UIInputCollapseTextSelection(input,0);
+            input.last_drag_click_time = -1.0;
             input.active_component = -1;
             buffer.clear();
         }
@@ -4435,6 +6309,33 @@ void UpdateInput(UIInput<Color>& input);
 
 #ifdef CSS_UI_INTERNAL_TEMPLATES
 template <typename T>
+inline bool CommitScalarInputTextEdit(UIInput<T>& input) {
+    if(
+        input.edit_buffer.empty() ||
+        input.edit_buffer == "-" ||
+        input.edit_buffer == "."
+    ) return false;
+
+    const T old_value = input.value;
+    try {
+        if constexpr(std::is_same_v<T,int>) {
+            input.value = std::stoi(input.edit_buffer);
+        }
+        else if constexpr(std::is_floating_point_v<T>) {
+            input.value = static_cast<T>(std::stod(input.edit_buffer));
+        }
+        input.value = SnapInputValue(input,input.value);
+    }
+    catch(...) {
+        return false;
+    }
+
+    const bool changed = input.value != old_value;
+    input.changed = input.changed || changed;
+    return changed;
+}
+
+template <typename T>
 inline void UpdateInput(UIInput<T>& input) {
     if(UpdateTriggerInput(input)) {
         return;
@@ -4445,7 +6346,7 @@ inline void UpdateInput(UIInput<T>& input) {
     Rectangle rect = input.rect.transform;
     Rectangle value_rect = GetInputValueRect(input);
     Rectangle slider_rect = GetSliderInteractionRect(input);
-    Vector2 mouse = GetMousePosition();
+    Vector2 mouse = GetUIMousePosition();
 
     input.hovered = CheckCollisionPointRec(mouse,rect);
 
@@ -4457,15 +6358,42 @@ inline void UpdateInput(UIInput<T>& input) {
 
     bool slider_hovered =input.input_type == InputType::Slider && CheckCollisionPointRec(mouse,slider_rect);
     input.slider_handle_hovered = false;
+    const bool vertical_slider =
+        input.slider_orientation == UISliderOrientation::Vertical;
+    const float slider_extent =
+        vertical_slider ? slider_rect.height : slider_rect.width;
     if(input.input_type == InputType::Slider) {
         const float normalized =GetInputNormalizedValue(input);
-        const float handle_x =slider_rect.x + slider_rect.width * normalized;
-        Rectangle handle_hitbox = {
-            handle_x - 14.0f,
-            slider_rect.y,
-            28.0f,
-            slider_rect.height
-        };
+        Rectangle handle_hitbox{};
+
+        if(vertical_slider) {
+            const float handle_margin = std::min(10.0f, slider_rect.height * 0.5f);
+            const float handle_y = std::clamp(
+                slider_rect.y + slider_rect.height * (1.0f-normalized),
+                slider_rect.y + handle_margin,
+                slider_rect.y + slider_rect.height - handle_margin
+            );
+            handle_hitbox = {
+                slider_rect.x,
+                handle_y - 14.0f,
+                slider_rect.width,
+                28.0f
+            };
+        }
+        else {
+            const float handle_margin = std::min(10.0f, slider_rect.width * 0.5f);
+            const float handle_x = std::clamp(
+                slider_rect.x + slider_rect.width * normalized,
+                slider_rect.x + handle_margin,
+                slider_rect.x + slider_rect.width - handle_margin
+            );
+            handle_hitbox = {
+                handle_x - 14.0f,
+                slider_rect.y,
+                28.0f,
+                slider_rect.height
+            };
+        }
 
         input.slider_handle_hovered =CheckCollisionPointRec(mouse,handle_hitbox);
     }
@@ -4476,10 +6404,18 @@ inline void UpdateInput(UIInput<T>& input) {
         CSS_UI_REQUESTED_CURSOR=MOUSE_CURSOR_POINTING_HAND;
     }
     else if(input.input_type == InputType::Drag &&value_hovered) {
-        CSS_UI_REQUESTED_CURSOR=MOUSE_CURSOR_RESIZE_EW;
+        CSS_UI_REQUESTED_CURSOR =
+            input.drag_text_editing
+                ? MOUSE_CURSOR_IBEAM
+                : MOUSE_CURSOR_RESIZE_EW;
     }
     if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        bool was_focused = input.focused;
+        const bool was_focused = input.focused;
+        const bool was_drag_text_editing = input.drag_text_editing;
+        const bool drag_double_click =
+            input.input_type == InputType::Drag &&
+            value_hovered &&
+            RegisterDragInputClick(input,mouse);
 
         if(!step_area_hovered) {
             input.focused =
@@ -4494,92 +6430,104 @@ inline void UpdateInput(UIInput<T>& input) {
         if(
             was_focused &&
             !input.focused &&
-            input.input_type == InputType::Instant
+            (
+                input.input_type == InputType::Instant ||
+                was_drag_text_editing
+            )
         ) {
-            if(
-                !input.edit_buffer.empty() &&
-                input.edit_buffer != "-" &&
-                input.edit_buffer != "."
-            ) {
-                T old_value = input.value;
-
-                try {
-                    if constexpr(std::is_same_v<T,int>) {
-                        input.value =
-                            std::stoi(input.edit_buffer);
-                    }
-                    else if constexpr(
-                        std::is_floating_point_v<T>
-                    ) {
-                        input.value = static_cast<T>(
-                            std::stod(input.edit_buffer)
-                        );
-                    }
-
-                    input.value =
-                        SnapInputValue(input,input.value);
-
-                    input.changed =
-                        input.changed ||
-                        input.value != old_value;
-                }
-                catch(...) {
-                }
-            }
-
+            CommitScalarInputTextEdit(input);
             input.edit_buffer.clear();
+            input.drag_text_editing = false;
+            input.drag_text_select_all = false;
+            input.last_drag_click_time = -1.0;
         }
 
         if(
             input.input_type == InputType::Slider &&
-            (
-                slider_hovered ||
-                input.slider_handle_hovered
-            )
+            (slider_hovered || input.slider_handle_hovered)
         ) {
-            if(
-                input.slider_click_to_set ||
-                input.slider_handle_hovered
-            ) {
+            if(input.slider_click_to_set || input.slider_handle_hovered) {
                 input.dragging = true;
-
-                if(
-                    input.slider_click_to_set &&
-                    slider_rect.width > 0.0f
-                ) {
+                if(input.slider_click_to_set && slider_extent > 0.0f) {
                     SetInputFromNormalized(
                         input,
-                        (mouse.x-slider_rect.x) /
-                            slider_rect.width
+                        GetSliderNormalizedFromPoint(input,slider_rect,mouse)
                     );
                 }
             }
         }
 
-        if(
-            input.input_type == InputType::Drag &&
-            value_hovered
-        ) {
-            input.dragging = true;
-            input.drag_start_value = input.value;
-            input.drag_accumulator = 0.0f;
+        if(input.input_type == InputType::Drag && value_hovered) {
+            if(drag_double_click) {
+                input.drag_text_editing = true;
+                input.dragging = false;
+                input.focused = true;
+                input.edit_buffer = FormatInputValue(input.value);
+                UIInputSelectAllText(input,input.edit_buffer);
+                input.caret_frame_counter = 0;
+            }
+            else if(!input.drag_text_editing) {
+                input.dragging = true;
+                input.drag_start_value = input.value;
+                input.drag_accumulator = 0.0f;
+            }
         }
 
         if(
             value_hovered &&
-            input.input_type == InputType::Instant
+            (input.input_type == InputType::Instant || input.drag_text_editing)
         ) {
             if(!was_focused || input.edit_buffer.empty()) {
-                input.edit_buffer =
-                    FormatInputValue(input.value);
+                input.edit_buffer = FormatInputValue(input.value);
             }
-
+            if(!drag_double_click) {
+                Rectangle text_rect = value_rect;
+                text_rect.x += input.style.padding.left;
+                text_rect.y += input.style.padding.top;
+                text_rect.width = std::max(
+                    0.0f,
+                    text_rect.width-input.style.padding.left-input.style.padding.right
+                );
+                text_rect.height = std::max(
+                    0.0f,
+                    text_rect.height-input.style.padding.top-input.style.padding.bottom
+                );
+                const bool extend =
+                    IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+                UIInputSetCaretFromMouse(
+                    input,input.edit_buffer,text_rect,input.style,mouse.x,extend
+                );
+                input.text_mouse_selecting = true;
+            }
             input.caret_frame_counter = 0;
         }
     }
 
     if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
         input.dragging = false;
+        input.text_mouse_selecting = false;
+    }
+
+    if(
+        input.text_mouse_selecting &&
+        IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+        input.focused &&
+        (input.input_type == InputType::Instant || input.drag_text_editing)
+    ) {
+        Rectangle text_rect = value_rect;
+        text_rect.x += input.style.padding.left;
+        text_rect.y += input.style.padding.top;
+        text_rect.width = std::max(
+            0.0f,
+            text_rect.width-input.style.padding.left-input.style.padding.right
+        );
+        text_rect.height = std::max(
+            0.0f,
+            text_rect.height-input.style.padding.top-input.style.padding.bottom
+        );
+        UIInputSetCaretFromMouse(
+            input,input.edit_buffer,text_rect,input.style,mouse.x,true
+        );
     }
 
     input.active = input.dragging;
@@ -4587,17 +6535,19 @@ inline void UpdateInput(UIInput<T>& input) {
     if(
         input.input_type == InputType::Slider &&
         input.dragging &&
-        slider_rect.width > 0.0f
+        slider_extent > 0.0f
     ) {
         SetInputFromNormalized(
             input,
-            (mouse.x-slider_rect.x) /
-                slider_rect.width
+            GetSliderNormalizedFromPoint(
+                input,slider_rect,mouse
+            )
         );
     }
 
     if(
         input.input_type == InputType::Drag &&
+        !input.drag_text_editing &&
         input.dragging
     ) {
         float modifier = 1.0f;
@@ -4616,7 +6566,7 @@ inline void UpdateInput(UIInput<T>& input) {
         }
 
         input.drag_accumulator +=
-            GetMouseDelta().x *
+            GetUIMouseDelta().x *
             input.drag_speed *
             modifier;
 
@@ -4646,6 +6596,7 @@ inline void UpdateInput(UIInput<T>& input) {
     if(
         input.hovered &&
         !input.dragging &&
+        !input.drag_text_editing &&
         (
             input.input_type == InputType::Slider ||
             input.input_type == InputType::Drag
@@ -4663,6 +6614,7 @@ inline void UpdateInput(UIInput<T>& input) {
 
     if(
         input.focused &&
+        !input.drag_text_editing &&
         (
             input.input_type == InputType::Slider ||
             input.input_type == InputType::Drag
@@ -4682,7 +6634,10 @@ inline void UpdateInput(UIInput<T>& input) {
         input.changed &&
         (
             input.input_type == InputType::Slider ||
-            input.input_type == InputType::Drag
+            (
+                input.input_type == InputType::Drag &&
+                !input.drag_text_editing
+            )
         )
     ) {
         input.edit_buffer =
@@ -4691,10 +6646,17 @@ inline void UpdateInput(UIInput<T>& input) {
     }
 
     if(
-        input.input_type == InputType::Instant &&
+        (
+            input.input_type == InputType::Instant ||
+            (
+                input.input_type == InputType::Drag &&
+                input.drag_text_editing
+            )
+        ) &&
         input.focused
     ) {
         input.caret_frame_counter++;
+        UIInputHandleTextNavigation(input,input.edit_buffer);
 
         int character = GetCharPressed();
 
@@ -4703,29 +6665,37 @@ inline void UpdateInput(UIInput<T>& input) {
                 character >= '0' &&
                 character <= '9';
 
-            bool minus =
-                character == '-' &&
-                input.edit_buffer.empty();
+            std::string preview = input.edit_buffer;
+            if(UIInputHasTextSelection(input)) {
+                preview.erase(
+                    input.text_selection_start,
+                    input.text_selection_end-input.text_selection_start
+                );
+            }
+
+            const std::size_t insertion_index = UIInputHasTextSelection(input)
+                ? input.text_selection_start
+                : input.text_caret;
+            bool minus = character == '-' && preview.empty() && insertion_index == 0;
 
             bool decimal =
                 character == '.' &&
-                input.edit_buffer.find('.') ==
-                    std::string::npos;
+                preview.find('.') == std::string::npos;
 
             if(
-                input.edit_buffer.size() <
-                input.max_characters
+                UIInputHasTextSelection(input) ||
+                input.edit_buffer.size() < input.max_characters
             ) {
                 if(digit || minus) {
-                    input.edit_buffer.push_back(
-                        static_cast<char>(character)
+                    UIInputInsertTextCharacter(
+                        input,input.edit_buffer,static_cast<char>(character)
                     );
                 }
                 else if constexpr(
                     std::is_floating_point_v<T>
                 ) {
                     if(decimal) {
-                        input.edit_buffer.push_back('.');
+                        UIInputInsertTextCharacter(input,input.edit_buffer,'.');
                     }
                 }
             }
@@ -4733,53 +6703,33 @@ inline void UpdateInput(UIInput<T>& input) {
             character = GetCharPressed();
         }
 
-        if(
-            IsKeyPressed(KEY_BACKSPACE) &&
-            !input.edit_buffer.empty()
-        ) {
-            input.edit_buffer.pop_back();
-            input.caret_frame_counter = 0;
+        if(IsKeyPressed(KEY_BACKSPACE)) {
+            UIInputBackspaceText(input,input.edit_buffer);
+        }
+
+        if(IsKeyPressed(KEY_DELETE)) {
+            UIInputDeleteText(input,input.edit_buffer);
         }
 
         if(IsKeyPressed(KEY_ENTER)) {
-            if(
-                !input.edit_buffer.empty() &&
-                input.edit_buffer != "-" &&
-                input.edit_buffer != "."
-            ) {
-                T old_value = input.value;
-
-                try {
-                    if constexpr(std::is_same_v<T,int>) {
-                        input.value =
-                            std::stoi(input.edit_buffer);
-                    }
-                    else if constexpr(
-                        std::is_floating_point_v<T>
-                    ) {
-                        input.value = static_cast<T>(
-                            std::stod(input.edit_buffer)
-                        );
-                    }
-
-                    input.value =
-                        SnapInputValue(input,input.value);
-
-                    input.changed =
-                        input.changed ||
-                        input.value != old_value;
-                }
-                catch(...) {
-                }
-            }
-
+            CommitScalarInputTextEdit(input);
             input.submitted = true;
             input.focused = false;
+            input.drag_text_editing = false;
+            input.drag_text_select_all = false;
+            input.text_mouse_selecting = false;
+            UIInputCollapseTextSelection(input,0);
+            input.last_drag_click_time = -1.0;
             input.edit_buffer.clear();
         }
 
         if(IsKeyPressed(KEY_ESCAPE)) {
             input.focused = false;
+            input.drag_text_editing = false;
+            input.drag_text_select_all = false;
+            input.text_mouse_selecting = false;
+            UIInputCollapseTextSelection(input,0);
+            input.last_drag_click_time = -1.0;
             input.edit_buffer.clear();
         }
     }
@@ -4815,7 +6765,7 @@ inline void UpdateRangeInput(UIRangeInput<T>& input) {
         1.0f,
         rect.width-input.style.padding.left-input.style.padding.right
     );
-    const Vector2 mouse = GetMousePosition();
+    const Vector2 mouse = GetUIMousePosition();
     input.hovered = CheckCollisionPointRec(mouse,rect);
 
     auto value_to_x = [&](T value) {
@@ -4862,7 +6812,51 @@ inline void UpdateRangeInput(UIRangeInput<T>& input) {
 }
 
 #endif // CSS_UI_INTERNAL_TEMPLATES
+// Superseded — perspective is now folded directly into style.transform_matrix
+// by EvaluateTransformMatrix, as the correct CSS-spec matrix in the same
+// local coordinate space as the rest of the transform, rather than as a
+// separate RL_PROJECTION camera/frustum switch. That switch-based approach
+// is what caused perspective distance to have no visible effect: composing
+// a frustum matrix onto raylib's ambient 2D orthographic projection diluted
+// the depth term almost to nothing, since the two matrices have wildly
+// different numeric scale. Left defined (unused) rather than deleted, in
+// case anything still references it.
+inline bool PushUIPerspective(const ComputedStyle& style, const Rectangle& bounds) {
+    if (!style.perspective) return false;
+    float d = ResolveCSSLength(*style.perspective, std::min(bounds.width, bounds.height),
+                               style.font_size, CSS_UI_ROOT_FONT_SIZE,
+                               style.custom_properties.get());
+    if (d <= 0.0f) return false;
 
+    // Switch to projection matrix
+    rlMatrixMode(RL_PROJECTION);
+    rlPushMatrix();
+
+    // Create a perspective matrix that matches CSS perspective.
+    // The vanishing point is at the center of the element.
+    float aspect = bounds.width / bounds.height;
+    float fov = 2.0f * atanf((bounds.height / 2.0f) / d);
+    float near = 0.1f;
+    float far = 1000.0f;
+    Matrix proj = MatrixPerspective(fov, aspect, near, far);
+
+    // Apply the perspective matrix relative to the element's center.
+    // CSS perspective origin defaults to center, so we translate the view
+    // so that the element's center is at the origin of the projection.
+    Vector2 center = { bounds.x + bounds.width/2.0f, bounds.y + bounds.height/2.0f };
+    rlTranslatef(-center.x, -center.y, 0.0f);
+    rlMultMatrixf(MatrixToFloat(proj));
+    rlTranslatef(center.x, center.y, 0.0f);
+
+    // Switch back to model-view for drawing children
+    rlMatrixMode(RL_MODELVIEW);
+    return true;
+}
+inline void PopUIPerspective() {
+    rlMatrixMode(RL_PROJECTION);
+    rlPopMatrix();
+    rlMatrixMode(RL_MODELVIEW);
+}
 void UpdateRangeInput(UIRangeInput<float>& input);
 void UpdateRangeInput(UIRangeInput<int>& input);
 
@@ -4903,16 +6897,41 @@ void DrawButton(
     const StyleSheet& style_sheet
 );
 
+const ComputedStyle& ResolveInteractiveStyleRef(
+    const StyleSheet& style_sheet,
+    SelectorType selector,
+    const ComputedStyle& base,
+    bool focused,
+    bool hovered,
+    bool active,
+    bool disabled,
+    UIElementBase& element,
+    std::size_t overlay_hash = 0
+);
+
 ComputedStyle ResolveInteractiveStyle(
     const StyleSheet& style_sheet,
     SelectorType selector,
-    ComputedStyle base,
+    const ComputedStyle& base,
     bool focused,
     bool hovered,
     bool active,
     bool disabled,
     UIElementBase* element = nullptr,
-    const std::string& animation_channel = {}
+    const std::string& animation_channel = {},
+    std::size_t overlay_hash = 0
+);
+
+void DrawStyledBox(
+    Rectangle rectangle,
+    const ComputedStyle& style
+);
+
+void DrawStyledTextContent(
+    Rectangle rectangle,
+    const std::string& text,
+    const ComputedStyle& style,
+    TextAlign alignment
 );
 
 void DrawStyledTextBox(
@@ -4943,7 +6962,7 @@ inline void DrawRangeInput(
     UIRangeInput<T>& input,
     const StyleSheet& style_sheet
 ) {
-    ComputedStyle style = ResolveInteractiveStyle(
+    const ComputedStyle& style = ResolveInteractiveStyleRef(
         style_sheet,
         SelectorType::RangeInput,
         input.style,
@@ -4951,10 +6970,21 @@ inline void DrawRangeInput(
         input.hovered,
         input.active_handle != 0,
         input.disabled || input.rect.inherited_disabled,
-        &input.rect
+        input.rect
     );
+    struct RangePseudoAfterScope {
+        UIElementBase& rect; const ComputedStyle& style; const StyleSheet& sheet;
+        ~RangePseudoAfterScope() {
+            DrawGeneratedPseudoElement(
+                rect,style,SelectorType::RangeInput,sheet,UIGeneratedPseudoKind::After
+            );
+        }
+    } range_pseudo_after{input.rect,style,style_sheet};
     const float visual_scale = EffectiveComputedStyleScale(style);
-    DrawStyledTextBox(input.rect.transform,"",style,TextAlign::Left);
+    DrawStyledBox(input.rect.transform,style);
+    DrawGeneratedPseudoElement(
+        input.rect,style,SelectorType::RangeInput,style_sheet,UIGeneratedPseudoKind::Before
+    );
     Rectangle track = {
         input.rect.transform.x+style.padding.left,
         input.rect.transform.y+input.rect.transform.height*0.5f-2.0f*visual_scale,
@@ -4972,12 +7002,13 @@ inline void DrawRangeInput(
         return track.x+t*track.width;
     };
     auto resolve_part = [&](ComputedStyle part_style, const char* part_class) {
+        if(!StyleSheetUsesPart(style_sheet,part_class)) return part_style;
         AddCSSClass(part_style.classes,part_class);
         part_style = ResolveStyleWithPseudoStates(
             style_sheet,
             SelectorType::RangeInput,
             style.id,
-            input.rect.pseudo_states.ActiveNames(),
+            input.rect.pseudo_states.ActiveNamesView(),
             part_style
         );
         return ResolveAnimatedStyle(
@@ -5044,14 +7075,14 @@ void DrawHorizontalDragArrows(
 
 #ifdef CSS_UI_INTERNAL_TEMPLATES
 template <typename T>
-inline ComputedStyle ResolveInputDrawStyle(
+inline const ComputedStyle& ResolveInputDrawStyle(
     UIInput<T>& input,
     const StyleSheet& style_sheet
 ) {
-    return ResolveInteractiveStyle(
+    return ResolveInteractiveStyleRef(
         style_sheet,SelectorType::Input,input.style,
         input.focused,input.hovered,input.active,
-        input.disabled || input.rect.inherited_disabled,&input.rect
+        input.disabled || input.rect.inherited_disabled,input.rect
     );
 }
 
@@ -5065,10 +7096,22 @@ inline ComputedStyle ResolveInputPartDrawStyle(
     bool focused,
     ComputedStyle draw_style
 ) {
+    if(!StyleSheetUsesPart(style_sheet,part_class)) {
+        ResolveComputedLengths(
+            draw_style,
+            input.rect.transform.width,
+            input.rect.transform.height,
+            input.style.font_size,
+            input.style.applied_inherited_scale,
+            true
+        );
+        return draw_style;
+    }
+
     std::vector<std::string> original_classes = draw_style.classes;
     AddCSSClass(draw_style.classes,part_class);
 
-    std::vector<std::string> active_states = input.rect.pseudo_states.ActiveNames();
+    std::vector<std::string> active_states = input.rect.pseudo_states.ActiveNamesView();
     auto set_state = [&](const char* name, bool enabled) {
         const std::string normalized = NormalizeUIPseudoStateName(name);
         auto found = std::find(active_states.begin(),active_states.end(),normalized);
@@ -5108,18 +7151,587 @@ inline ComputedStyle ResolveInputPartDrawStyle(
 }
 
 template <typename T>
+inline ComputedStyle ResolveInputLabelDrawStyle(
+    UIInput<T>& input,
+    const StyleSheet& style_sheet,
+    const ComputedStyle& draw_style
+) {
+    ComputedStyle label_style = draw_style;
+
+    // Scalar labels inherit typography only. Their box is transparent unless
+    // input::label (or a class-specific ::label selector) styles it.
+    label_style.background_color = BLANK;
+    label_style.border_color = BLANK;
+    label_style.border_width = 0.0f;
+    label_style.border_widths = EdgeValues{};
+    label_style.border_width_length.reset();
+    label_style.border_width_lengths = EdgeLengthValues{};
+    label_style.border_radius = 0.0f;
+    label_style.padding = {};
+    label_style.margin = {};
+    label_style.padding_lengths = {};
+    label_style.margin_lengths = {};
+    label_style.width_length.reset();
+    label_style.height_length.reset();
+    label_style.min_width_length.reset();
+    label_style.max_width_length.reset();
+    label_style.min_height_length.reset();
+    label_style.max_height_length.reset();
+
+    const float default_gap =
+        4.0f * EffectiveComputedStyleScale(draw_style);
+    if(input.label_layout == InputLabelLayout::Back) {
+        label_style.margin.right = default_gap;
+    }
+    else {
+        label_style.margin.left = default_gap;
+    }
+
+    if(!StyleSheetUsesPart(style_sheet,CSS_INPUT_LABEL_PART)) {
+        ResolveComputedLengths(
+            label_style,
+            input.rect.transform.width,
+            input.rect.transform.height,
+            input.style.font_size,
+            input.style.applied_inherited_scale,
+            true
+        );
+        return label_style;
+    }
+
+    std::vector<std::string> original_classes = label_style.classes;
+    AddCSSClass(label_style.classes,CSS_INPUT_LABEL_PART);
+
+    std::vector<std::string> active_states =
+        input.rect.pseudo_states.ActiveNamesView();
+    auto set_state = [&](const char* name, bool enabled) {
+        const std::string normalized = NormalizeUIPseudoStateName(name);
+        auto found = std::find(active_states.begin(),active_states.end(),normalized);
+        if(enabled && found == active_states.end()) active_states.push_back(normalized);
+        else if(!enabled && found != active_states.end()) active_states.erase(found);
+    };
+    set_state("focus",input.focused);
+    set_state("hover",input.hovered);
+    set_state("active",input.active);
+    set_state("disabled",input.disabled || input.rect.inherited_disabled);
+
+    label_style = ResolveStyleWithPseudoStates(
+        style_sheet,
+        SelectorType::Input,
+        input.style.id,
+        active_states,
+        label_style
+    );
+    label_style = ResolveAnimatedStyle(
+        input.rect,
+        style_sheet,
+        std::move(label_style),
+        CSS_INPUT_LABEL_PART
+    );
+
+    ResolveComputedLengths(
+        label_style,
+        input.rect.transform.width,
+        input.rect.transform.height,
+        input.style.font_size,
+        input.style.applied_inherited_scale,
+        true
+    );
+
+    label_style.classes = std::move(original_classes);
+    return label_style;
+}
+
+inline const char* InputComponentLabelPartClass(int index) {
+    switch(index) {
+        case 0: return CSS_INPUT_COMPONENT_0_LABEL_PART;
+        case 1: return CSS_INPUT_COMPONENT_1_LABEL_PART;
+        case 2: return CSS_INPUT_COMPONENT_2_LABEL_PART;
+        case 3: return CSS_INPUT_COMPONENT_3_LABEL_PART;
+        default: return CSS_INPUT_COMPONENT_LABEL_PART;
+    }
+}
+
+template <typename T>
+inline ComputedStyle ResolveInputComponentLabelDrawStyle(
+    UIInput<T>& input,
+    const StyleSheet& style_sheet,
+    int component_index,
+    bool hovered,
+    bool active,
+    const ComputedStyle& draw_style
+) {
+        ComputedStyle label_style = draw_style;
+
+    // Default component-label appearance.
+    label_style.background_color = BLANK;
+    label_style.border_color = BLANK;
+    label_style.border_width = 0.0f;
+    label_style.border_widths = EdgeValues{};
+    label_style.border_width_length.reset();
+    label_style.border_width_lengths = EdgeLengthValues{};
+    label_style.border_radius = 0.0f;
+
+    label_style.padding = {};
+    label_style.margin = {};
+
+    label_style.padding_lengths = {};
+    label_style.margin_lengths = {};
+
+    label_style.width_length.reset();
+    label_style.height_length.reset();
+    label_style.min_width_length.reset();
+    label_style.max_width_length.reset();
+    label_style.min_height_length.reset();
+    label_style.max_height_length.reset();
+
+    const float default_gap =
+        4.0f * EffectiveComputedStyleScale(draw_style);
+    if(input.component_label_layout == InputLabelLayout::Front) {
+        label_style.margin.left = default_gap;
+    }
+    else {
+        label_style.margin.right = default_gap;
+    }
+
+    const char* component_part =
+        InputComponentLabelPartClass(component_index);
+
+    if(
+        !StyleSheetUsesPart(style_sheet,CSS_INPUT_COMPONENT_LABEL_PART) &&
+        !StyleSheetUsesPart(style_sheet,component_part)
+    ) {
+        ResolveComputedLengths(
+            label_style,
+            input.rect.transform.width,
+            input.rect.transform.height,
+            input.style.font_size,
+            input.style.applied_inherited_scale,
+            true
+        );
+        return label_style;
+    }
+
+    std::vector<std::string> original_classes = label_style.classes;
+    AddCSSClass(label_style.classes,CSS_INPUT_COMPONENT_LABEL_PART);
+    AddCSSClass(label_style.classes,component_part);
+
+    std::vector<std::string> active_states =
+        input.rect.pseudo_states.ActiveNamesView();
+    auto set_state = [&](const char* name, bool enabled) {
+        const std::string normalized = NormalizeUIPseudoStateName(name);
+        auto found = std::find(active_states.begin(),active_states.end(),normalized);
+        if(enabled && found == active_states.end()) active_states.push_back(normalized);
+        else if(!enabled && found != active_states.end()) active_states.erase(found);
+    };
+    set_state("focus",input.focused);
+    set_state("hover",hovered);
+    set_state("active",active);
+    set_state("disabled",input.disabled || input.rect.inherited_disabled);
+
+    label_style = ResolveStyleWithPseudoStates(
+        style_sheet,
+        SelectorType::Input,
+        input.style.id,
+        active_states,
+        label_style
+    );
+    label_style = ResolveAnimatedStyle(
+        input.rect,
+        style_sheet,
+        std::move(label_style),
+        component_part
+    );
+
+    ResolveComputedLengths(
+        label_style,
+        input.rect.transform.width,
+        input.rect.transform.height,
+        input.style.font_size,
+        input.style.applied_inherited_scale,
+        true
+    );
+
+    label_style.classes = std::move(original_classes);
+    return label_style;
+}
+
+template <typename T>
+inline Vector2 DrawScalarInputLabelValue(
+    UIInput<T>& input,
+    const StyleSheet& style_sheet,
+    Rectangle content_rect,
+    const std::string& value_text,
+    const ComputedStyle& draw_style
+) {
+    Font value_font = ResolveUIFont(draw_style.font);
+    Vector2 value_size = MeasureTextCached(
+        value_font,
+        value_text.c_str(),
+        draw_style.font_size,
+        1.0f
+    );
+
+    auto draw_value = [&](Vector2 position) {
+        const bool editing =
+            input.focused &&
+            (
+                input.input_type == InputType::Instant ||
+                (input.input_type == InputType::Drag && input.drag_text_editing)
+            );
+        DrawUIInputTextSelectionAndCaret(
+            input,
+            value_font,
+            value_text,
+            position,
+            draw_style.font_size,
+            ApplyStyleOpacity(draw_style.text_color,draw_style.opacity),
+            editing
+        );
+        DrawUIText(
+            value_font,
+            value_text.c_str(),
+            position,
+            draw_style.font_size,
+            1.0f,
+            ApplyStyleOpacity(draw_style.text_color,draw_style.opacity)
+        );
+    };
+
+    auto centered_value_position = [&]() {
+        return Vector2{
+            std::round(GetTextX(content_rect,value_size.x,draw_style.text_align)),
+            std::round(
+                content_rect.y+
+                (content_rect.height-value_size.y)*0.5f
+            )
+        };
+    };
+
+    const bool has_label =
+        input.show_label &&
+        !input.text.empty() &&
+        (
+            std::is_same_v<T,float> ||
+            std::is_same_v<T,int>
+        );
+
+    if(!has_label) {
+        Vector2 value_position = centered_value_position();
+        draw_value(value_position);
+        return value_position;
+    }
+
+    ComputedStyle label_style = ResolveInputLabelDrawStyle(
+        input,
+        style_sheet,
+        draw_style
+    );
+
+    if(label_style.display == DisplayType::None) {
+        Vector2 value_position = centered_value_position();
+        draw_value(value_position);
+        return value_position;
+    }
+
+    Font label_font = ResolveUIFont(label_style.font);
+    Vector2 label_text_size = MeasureTextCached(
+        label_font,
+        input.text.c_str(),
+        label_style.font_size,
+        1.0f
+    );
+
+    const float label_width =
+        label_text_size.x+
+        label_style.padding.left+
+        label_style.padding.right;
+    const float label_height = std::min(
+        content_rect.height,
+        label_text_size.y+
+        label_style.padding.top+
+        label_style.padding.bottom
+    );
+    const bool label_before =
+        input.label_layout == InputLabelLayout::Back;
+    const float label_gap = std::max(
+        0.0f,
+        label_before
+            ? label_style.margin.right
+            : label_style.margin.left
+    );
+    const float group_width =
+        label_width+label_gap+value_size.x;
+    const float group_x = GetTextX(
+        content_rect,
+        group_width,
+        draw_style.text_align
+    );
+
+    const float label_x = label_before
+        ? group_x
+        : group_x+value_size.x+label_gap;
+    Vector2 value_position = {
+        std::round(
+            label_before
+                ? group_x+label_width+label_gap
+                : group_x
+        ),
+        std::round(
+            content_rect.y+
+            (content_rect.height-value_size.y)*0.5f
+        )
+    };
+
+    Rectangle label_rect = {
+        label_x,
+        content_rect.y+(content_rect.height-label_height)*0.5f,
+        std::min(label_width,content_rect.width),
+        label_height
+    };
+
+    if(label_style.background_color.a > 0) {
+        DrawRectangleRounded(
+            label_rect,
+            ResolveUIBorderRoundness(label_rect,label_style.border_radius),
+            6,
+            ApplyStyleOpacity(label_style.background_color,label_style.opacity)
+        );
+    }
+
+    DrawStyleBorder(
+        label_rect,label_style,
+        ApplyStyleOpacity(label_style.border_color,label_style.opacity),6
+    );
+
+    Rectangle label_content = {
+        label_rect.x+label_style.padding.left,
+        label_rect.y+label_style.padding.top,
+        std::max(
+            0.0f,
+            label_rect.width-
+            label_style.padding.left-
+            label_style.padding.right
+        ),
+        std::max(
+            0.0f,
+            label_rect.height-
+            label_style.padding.top-
+            label_style.padding.bottom
+        )
+    };
+
+    DrawUIText(
+        label_font,
+        input.text.c_str(),
+        {
+            std::round(
+                GetTextX(
+                    label_content,
+                    label_text_size.x,
+                    label_style.text_align
+                )
+            ),
+            std::round(
+                label_content.y+
+                (label_content.height-label_text_size.y)*0.5f
+            )
+        },
+        label_style.font_size,
+        1.0f,
+        ApplyStyleOpacity(label_style.text_color,label_style.opacity)
+    );
+
+    draw_value(value_position);
+
+    return value_position;
+}
+
+template <typename T>
+inline void DrawInputComponentText(
+    UIInput<T>& input,
+    const StyleSheet& style_sheet,
+    int component_index,
+    Rectangle component_rect,
+    const std::string& value_text,
+    const ComputedStyle& draw_style,
+    bool component_hovered,
+    bool component_active
+) {
+    Font value_font = ResolveUIFont(draw_style.font);
+    Vector2 value_size = MeasureTextCached(
+        value_font,
+        value_text.c_str(),
+        draw_style.font_size,
+        1.0f
+    );
+
+    auto draw_value = [&](Vector2 position) {
+        const bool editing =
+            input.focused &&
+            input.active_component == component_index &&
+            (
+                input.input_type == InputType::Instant ||
+                (input.input_type == InputType::Drag && input.drag_text_editing)
+            );
+        DrawUIInputTextSelectionAndCaret(
+            input,
+            value_font,
+            value_text,
+            position,
+            draw_style.font_size,
+            ApplyStyleOpacity(draw_style.text_color,draw_style.opacity),
+            editing
+        );
+        DrawUIText(
+            value_font,
+            value_text.c_str(),
+            position,
+            draw_style.font_size,
+            1.0f,
+            ApplyStyleOpacity(draw_style.text_color,draw_style.opacity)
+        );
+    };
+
+    const bool has_label =
+        input.show_component_labels &&
+        component_index >= 0 &&
+        component_index < static_cast<int>(input.component_labels.size()) &&
+        !input.component_labels[static_cast<std::size_t>(component_index)].empty();
+
+    if(!has_label) {
+        draw_value({
+            std::round(component_rect.x + (component_rect.width-value_size.x)*0.5f),
+            std::round(component_rect.y + (component_rect.height-value_size.y)*0.5f)
+        });
+        return;
+    }
+
+    const std::string& label_text =
+        input.component_labels[static_cast<std::size_t>(component_index)];
+
+    ComputedStyle label_style = ResolveInputComponentLabelDrawStyle(
+        input,
+        style_sheet,
+        component_index,
+        component_hovered,
+        component_active,
+        draw_style
+    );
+
+    if(label_style.display == DisplayType::None) {
+        draw_value({
+            std::round(component_rect.x + (component_rect.width-value_size.x)*0.5f),
+            std::round(component_rect.y + (component_rect.height-value_size.y)*0.5f)
+        });
+        return;
+    }
+
+    Font label_font = ResolveUIFont(label_style.font);
+    Vector2 label_text_size = MeasureTextCached(
+        label_font,
+        label_text.c_str(),
+        label_style.font_size,
+        1.0f
+    );
+
+    const float label_width =
+        label_text_size.x +
+        label_style.padding.left +
+        label_style.padding.right;
+    const float label_height = std::min(
+        component_rect.height,
+        label_text_size.y +
+        label_style.padding.top +
+        label_style.padding.bottom
+    );
+    const bool label_before =
+        input.component_label_layout == InputLabelLayout::Back;
+    const float label_gap = std::max(
+        0.0f,
+        label_before
+            ? label_style.margin.right
+            : label_style.margin.left
+    );
+    const float group_width = label_width + label_gap + value_size.x;
+    const float group_x =
+        component_rect.x +
+        std::max(0.0f,(component_rect.width-group_width)*0.5f);
+
+    const float label_x = label_before
+        ? group_x
+        : group_x+value_size.x+label_gap;
+    const float value_x = label_before
+        ? group_x+label_width+label_gap
+        : group_x;
+
+    Rectangle label_rect = {
+        label_x,
+        component_rect.y + (component_rect.height-label_height)*0.5f,
+        std::min(label_width,component_rect.width),
+        label_height
+    };
+
+    if(label_style.background_color.a > 0) {
+        DrawRectangleRounded(
+            label_rect,
+            ResolveUIBorderRoundness(label_rect,label_style.border_radius),
+            6,
+            ApplyStyleOpacity(label_style.background_color,label_style.opacity)
+        );
+    }
+
+    DrawStyleBorder(
+        label_rect,label_style,
+        ApplyStyleOpacity(label_style.border_color,label_style.opacity),6
+    );
+
+    Rectangle label_content = {
+        label_rect.x + label_style.padding.left,
+        label_rect.y + label_style.padding.top,
+        std::max(0.0f,label_rect.width-label_style.padding.left-label_style.padding.right),
+        std::max(0.0f,label_rect.height-label_style.padding.top-label_style.padding.bottom)
+    };
+
+    DrawUIText(
+        label_font,
+        label_text.c_str(),
+        {
+            std::round(GetTextX(label_content,label_text_size.x,label_style.text_align)),
+            std::round(label_content.y+(label_content.height-label_text_size.y)*0.5f)
+        },
+        label_style.font_size,
+        1.0f,
+        ApplyStyleOpacity(label_style.text_color,label_style.opacity)
+    );
+
+    draw_value({
+        std::round(value_x),
+        std::round(component_rect.y+(component_rect.height-value_size.y)*0.5f)
+    });
+}
+
+template <typename T>
 inline void DrawTriggerInput(
     UIInput<T>& input,
     const StyleSheet& style_sheet
 ) {
-    ComputedStyle draw_style =
+    const ComputedStyle& draw_style =
         ResolveInputDrawStyle(input,style_sheet);
+    struct InputPseudoAfterScope {
+        UIElementBase& rect; const ComputedStyle& style; const StyleSheet& sheet;
+        ~InputPseudoAfterScope() {
+            DrawGeneratedPseudoElement(
+                rect,style,SelectorType::Input,sheet,UIGeneratedPseudoKind::After
+            );
+        }
+    } input_pseudo_after{input.rect,draw_style,style_sheet};
 
     Rectangle rect = input.rect.transform;
 
     DrawRectangleRounded(
         rect,
-        draw_style.border_radius,
+        ResolveUIBorderRoundness(rect,draw_style.border_radius),
         8,
         ApplyStyleOpacity(
             draw_style.background_color,
@@ -5127,15 +7739,12 @@ inline void DrawTriggerInput(
         )
     );
 
-    DrawRectangleRoundedLinesEx(
-        rect,
-        draw_style.border_radius,
-        8,
-        draw_style.border_width,
-        ApplyStyleOpacity(
-            draw_style.border_color,
-            draw_style.opacity
-        )
+    DrawStyleBorder(
+        rect,draw_style,
+        ApplyStyleOpacity(draw_style.border_color,draw_style.opacity),8
+    );
+    DrawGeneratedPseudoElement(
+        input.rect,draw_style,SelectorType::Input,style_sheet,UIGeneratedPseudoKind::Before
     );
 
     Rectangle content = {
@@ -5173,7 +7782,7 @@ inline void DrawTriggerInput(
             (content.height-text_size.y)*0.5f
     };
 
-    DrawTextEx(
+    DrawUIText(
         font,
         input.text.c_str(),
         text_position,
@@ -5244,7 +7853,7 @@ inline void DrawInputStepButtons(
         ) {
             DrawRectangleRounded(
                 rect,
-                style.border_radius,
+                ResolveUIBorderRoundness(rect,style.border_radius),
                 6,
                 ApplyStyleOpacity(
                     style.background_color,
@@ -5252,15 +7861,15 @@ inline void DrawInputStepButtons(
                 )
             );
 
-            DrawRectangleRoundedLinesEx(
-                rect,
-                style.border_radius,
-                6,
-                std::max(1.0f, style.border_width),
-                ApplyStyleOpacity(
-                    style.border_color,
-                    style.opacity
-                )
+            ComputedStyle border_style = style;
+            if(MaximumBorderWidth(border_style) < 1.0f) {
+                border_style.border_width = 1.0f;
+                border_style.border_widths = EdgeValues(1.0f);
+                border_style.border_width_lengths = EdgeLengthValues{};
+            }
+            DrawStyleBorder(
+                rect,border_style,
+                ApplyStyleOpacity(style.border_color,style.opacity),6
             );
 
             Font font = ResolveUIFont(style.font);
@@ -5272,7 +7881,7 @@ inline void DrawInputStepButtons(
                 1.0f
             );
 
-            DrawTextEx(
+            DrawUIText(
                 font,
                 caption,
                 {
@@ -5341,7 +7950,7 @@ inline void DrawInput(
         return;
     }
 
-    ComputedStyle draw_style =
+    const ComputedStyle& draw_style =
         ResolveInputDrawStyle(input,style_sheet);
     const float visual_scale = EffectiveComputedStyleScale(draw_style);
 
@@ -5353,7 +7962,7 @@ inline void DrawInput(
 
     DrawRectangleRounded(
         outer_rect,
-        draw_style.border_radius,
+        ResolveUIBorderRoundness(outer_rect,draw_style.border_radius),
         8,
         ApplyStyleOpacity(
             draw_style.background_color,
@@ -5361,16 +7970,19 @@ inline void DrawInput(
         )
     );
 
-    DrawRectangleRoundedLinesEx(
-        outer_rect,
-        draw_style.border_radius,
-        8,
-        draw_style.border_width,
-        ApplyStyleOpacity(
-            draw_style.border_color,
-            draw_style.opacity
-        )
+    DrawStyleBorder(
+        outer_rect,draw_style,
+        ApplyStyleOpacity(draw_style.border_color,draw_style.opacity),8
     );
+    DrawGeneratedPseudoElement(
+        input.rect,draw_style,SelectorType::Input,style_sheet,UIGeneratedPseudoKind::Before
+    );
+    struct ScalarInputPseudoAfterScope {
+        UIElementBase& rect; const ComputedStyle& style; const StyleSheet& sheet;
+        ~ScalarInputPseudoAfterScope() {
+            DrawGeneratedPseudoElement(rect,style,SelectorType::Input,sheet,UIGeneratedPseudoKind::After);
+        }
+    } scalar_input_pseudo_after{input.rect,draw_style,style_sheet};
 
     DrawInputStepButtons(input,style_sheet,draw_style,input.step_button_layout);
 
@@ -5384,7 +7996,7 @@ inline void DrawInput(
         input.show_value_box
     ) {
         bool value_hovered = CheckCollisionPointRec(
-            GetMousePosition(),
+            GetUIMousePosition(),
             value_rect
         );
 
@@ -5436,11 +8048,18 @@ inline void DrawInput(
         input.input_type == InputType::Instant ||
         input.input_type == InputType::Drag
     ) {
-        std::string value_text =
-            input.input_type == InputType::Instant &&
-            input.focused
-                ? input.edit_buffer
-                : FormatInputValue(input.value);
+        const bool text_editing =
+            input.focused &&
+            (
+                input.input_type == InputType::Instant ||
+                (
+                    input.input_type == InputType::Drag &&
+                    input.drag_text_editing
+                )
+            );
+        std::string value_text = text_editing
+            ? input.edit_buffer
+            : FormatInputValue(input.value);
 
         Font font = ResolveUIFont(draw_style.font);
         Vector2 text_size = MeasureTextCached(
@@ -5450,34 +8069,23 @@ inline void DrawInput(
             1.0f
         );
 
-        Vector2 text_position = {
-            GetTextX(
-                content,
-                text_size.x,
-                draw_style.text_align
-            ),
-            content.y +
-                (content.height-text_size.y)*0.5f
-        };
+        Vector2 text_position = DrawScalarInputLabelValue(
+            input,
+            style_sheet,
+            content,
+            value_text,
+            draw_style
+        );
 
         Color text_color = ApplyStyleOpacity(
             draw_style.text_color,
             draw_style.opacity
         );
 
-        DrawTextEx(
-            font,
-            value_text.c_str(),
-            {
-                std::round(text_position.x),
-                std::round(text_position.y)
-            },
-            draw_style.font_size,
-            1.0f,
-            text_color
-        );
-
-        if(input.input_type == InputType::Drag) {
+        if(
+            input.input_type == InputType::Drag &&
+            !input.drag_text_editing
+        ) {
             DrawHorizontalDragArrows(
                 content,
                 ApplyStyleOpacity(
@@ -5485,30 +8093,6 @@ inline void DrawInput(
                     draw_style.opacity*0.65f
                 ),
                 visual_scale
-            );
-        }
-
-        if(
-            input.input_type == InputType::Instant &&
-            input.focused &&
-            ((input.caret_frame_counter/20)%2)==0 &&
-            input.edit_buffer.size() <
-                input.max_characters
-        ) {
-            DrawTextEx(
-                font,
-                "_",
-                Vector2{
-                    std::round(
-                        text_position.x+
-                        text_size.x+
-                        2.0f
-                    ),
-                    std::round(text_position.y)
-                },
-                draw_style.font_size,
-                1.0f,
-                text_color
             );
         }
 
@@ -5531,6 +8115,12 @@ inline void DrawInput(
     track_fallback.border_color =
         draw_style.border_color;
     track_fallback.border_width = 0.0f;
+    track_fallback.border_widths = EdgeValues{};
+    track_fallback.border_width_length.reset();
+    track_fallback.border_width_lengths = EdgeLengthValues{};
+    track_fallback.width = 6.0f;
+    track_fallback.width_length =
+        CSSLength{6.0f,LengthUnit::Pixels};
     track_fallback.height = 6.0f;
     track_fallback.height_length =
         CSSLength{6.0f,LengthUnit::Pixels};
@@ -5568,6 +8158,12 @@ inline void DrawInput(
     handle_fallback.border_color =
         draw_style.background_color;
     handle_fallback.border_width = 2.0f;
+    handle_fallback.border_widths = EdgeValues(2.0f);
+    handle_fallback.border_width_length = CSSLength{2.0f,LengthUnit::Pixels};
+    handle_fallback.border_width_lengths.left = handle_fallback.border_width_length;
+    handle_fallback.border_width_lengths.right = handle_fallback.border_width_length;
+    handle_fallback.border_width_lengths.top = handle_fallback.border_width_length;
+    handle_fallback.border_width_lengths.bottom = handle_fallback.border_width_length;
     handle_fallback.width = 20.0f;
     handle_fallback.height = 20.0f;
     handle_fallback.width_length =
@@ -5590,20 +8186,37 @@ inline void DrawInput(
     const float normalized =
         GetInputNormalizedValue(input);
 
-    Rectangle track = {
-        slider_rect.x,
-        slider_rect.y+
-            (
-                slider_rect.height-
-                track_style.height
-            )*0.5f,
-        slider_rect.width,
-        std::max(1.0f,track_style.height)
-    };
+    const bool vertical_slider =
+        input.slider_orientation == UISliderOrientation::Vertical;
+
+    Rectangle track{};
+    if(vertical_slider) {
+        const float track_width =
+            std::max(1.0f,track_style.width);
+        track = {
+            slider_rect.x+
+                (slider_rect.width-track_width)*0.5f,
+            slider_rect.y,
+            track_width,
+            slider_rect.height
+        };
+    }
+    else {
+        track = {
+            slider_rect.x,
+            slider_rect.y+
+                (
+                    slider_rect.height-
+                    track_style.height
+                )*0.5f,
+            slider_rect.width,
+            std::max(1.0f,track_style.height)
+        };
+    }
 
     DrawRectangleRounded(
         track,
-        track_style.border_radius,
+        ResolveUIBorderRoundness(track,track_style.border_radius),
         8,
         ApplyStyleOpacity(
             track_style.background_color,
@@ -5611,37 +8224,84 @@ inline void DrawInput(
         )
     );
 
-    if(track_style.border_width > 0.0f) {
-        DrawRectangleRoundedLinesEx(
-            track,
-            track_style.border_radius,
-            8,
-            track_style.border_width,
-            ApplyStyleOpacity(
-                track_style.border_color,
-                track_style.opacity
-            )
+    DrawStyleBorder(
+        track,track_style,
+        ApplyStyleOpacity(track_style.border_color,track_style.opacity),8
+    );
+
+    Rectangle filled_track{};
+    Rectangle handle{};
+
+    if(vertical_slider) {
+        const float handle_half_height =
+            std::min(handle_style.height * 0.5f, track.height * 0.5f);
+        const float handle_center_y = std::clamp(
+            track.y + track.height * (1.0f-normalized),
+            track.y + handle_half_height,
+            track.y + track.height - handle_half_height
         );
+        const float fill_width =
+            std::max(1.0f,fill_style.width);
+
+        filled_track = {
+            track.x+(track.width-fill_width)*0.5f,
+            handle_center_y,
+            fill_width,
+            std::max(0.0f,track.y+track.height-handle_center_y)
+        };
+
+        handle = {
+            track.x+
+                track.width*0.5f-
+                handle_style.width*0.5f,
+            handle_center_y-
+                handle_style.height*0.5f,
+            std::max(2.0f,handle_style.width),
+            std::max(2.0f,handle_style.height)
+        };
+    }
+    else {
+        const float handle_half_width =
+            std::min(handle_style.width * 0.5f, track.width * 0.5f);
+        const float handle_center_x = std::clamp(
+            track.x + track.width * normalized,
+            track.x + handle_half_width,
+            track.x + track.width - handle_half_width
+        );
+
+        filled_track = {
+            track.x,
+            track.y,
+            std::max(0.0f, handle_center_x - track.x),
+            std::max(1.0f,fill_style.height)
+        };
+
+        filled_track.y =
+            track.y+
+            (
+                track.height-
+                filled_track.height
+            )*0.5f;
+
+        handle = {
+            handle_center_x-
+                handle_style.width*0.5f,
+            track.y+
+                track.height*0.5f-
+                handle_style.height*0.5f,
+            std::max(2.0f,handle_style.width),
+            std::max(2.0f,handle_style.height)
+        };
     }
 
-    Rectangle filled_track = {
-        track.x,
-        track.y,
-        track.width*normalized,
-        std::max(1.0f,fill_style.height)
-    };
+    const bool has_fill = vertical_slider
+        ? filled_track.height > 0.0f
+        : filled_track.width > 0.0f;
 
-    filled_track.y =
-        track.y+
-        (
-            track.height-
-            filled_track.height
-        )*0.5f;
-
-    if(filled_track.width > 0.0f) {
+    if(has_fill) {
         DrawRectangleRounded(
             filled_track,
-            fill_style.border_radius,
+            ResolveUIBorderRoundness(filled_track,fill_style.border_radius),
             8,
             ApplyStyleOpacity(
                 fill_style.background_color,
@@ -5650,20 +8310,9 @@ inline void DrawInput(
         );
     }
 
-    Rectangle handle = {
-        track.x+
-            track.width*normalized-
-            handle_style.width*0.5f,
-        track.y+
-            track.height*0.5f-
-            handle_style.height*0.5f,
-        std::max(2.0f,handle_style.width),
-        std::max(2.0f,handle_style.height)
-    };
-
     DrawRectangleRounded(
         handle,
-        handle_style.border_radius,
+        ResolveUIBorderRoundness(handle,handle_style.border_radius),
         8,
         ApplyStyleOpacity(
             handle_style.background_color,
@@ -5671,74 +8320,56 @@ inline void DrawInput(
         )
     );
 
-    if(handle_style.border_width > 0.0f) {
-        DrawRectangleRoundedLinesEx(
-            handle,
-            handle_style.border_radius,
-            8,
-            handle_style.border_width,
-            ApplyStyleOpacity(
-                handle_style.border_color,
-                handle_style.opacity
-            )
-        );
-    }
+    DrawStyleBorder(
+        handle,handle_style,
+        ApplyStyleOpacity(handle_style.border_color,handle_style.opacity),8
+    );
 
     if(input.slider_show_value) {
-        Rectangle value_display = {
-            slider_rect.x+
-                slider_rect.width+
-                8.0f,
-            content.y,
-            std::max(
-                0.0f,
-                content.x+
-                    content.width-
-                    (
-                        slider_rect.x+
-                        slider_rect.width+
-                        8.0f
-                    )
-            ),
-            content.height
-        };
+        Rectangle value_display{};
+
+        if(vertical_slider) {
+            const float value_y =
+                slider_rect.y+slider_rect.height+8.0f;
+            value_display = {
+                content.x,
+                value_y,
+                content.width,
+                std::max(
+                    0.0f,
+                    content.y+content.height-value_y
+                )
+            };
+        }
+        else {
+            value_display = {
+                slider_rect.x+
+                    slider_rect.width+
+                    8.0f,
+                content.y,
+                std::max(
+                    0.0f,
+                    content.x+
+                        content.width-
+                        (
+                            slider_rect.x+
+                            slider_rect.width+
+                            8.0f
+                        )
+                ),
+                content.height
+            };
+        }
 
         const std::string value_text =
             FormatInputValue(input.value);
 
-        Font font = ResolveUIFont(draw_style.font);
-        Vector2 value_size = MeasureTextCached(
-            font,
-            value_text.c_str(),
-            draw_style.font_size,
-            1.0f
-        );
-
-        DrawTextEx(
-            font,
-            value_text.c_str(),
-            {
-                std::round(
-                    value_display.x+
-                    (
-                        value_display.width-
-                        value_size.x
-                    )*0.5f
-                ),
-                std::round(
-                    value_display.y+
-                    (
-                        value_display.height-
-                        value_size.y
-                    )*0.5f
-                )
-            },
-            draw_style.font_size,
-            1.0f,
-            ApplyStyleOpacity(
-                draw_style.text_color,
-                draw_style.opacity
-            )
+        DrawScalarInputLabelValue(
+            input,
+            style_sheet,
+            value_display,
+            value_text,
+            draw_style
         );
     }
 }
@@ -5771,7 +8402,7 @@ inline void DrawVectorInput(
         return;
     }
 
-    ComputedStyle draw_style = ResolveInputDrawStyle(input,style_sheet);
+    const ComputedStyle& draw_style = ResolveInputDrawStyle(input,style_sheet);
 
     Rectangle outer_rect = input.rect.transform;
 
@@ -5794,18 +8425,24 @@ inline void DrawVectorInput(
 
     DrawRectangleRounded(
         outer_rect,
-        draw_style.border_radius,
+        ResolveUIBorderRoundness(outer_rect,draw_style.border_radius),
         8,
         ApplyStyleOpacity(draw_style.background_color,draw_style.opacity)
     );
 
-    DrawRectangleRoundedLinesEx(
-        outer_rect,
-        draw_style.border_radius,
-        8,
-        draw_style.border_width,
-        ApplyStyleOpacity(draw_style.border_color,draw_style.opacity)
+    DrawStyleBorder(
+        outer_rect,draw_style,
+        ApplyStyleOpacity(draw_style.border_color,draw_style.opacity),8
     );
+    DrawGeneratedPseudoElement(
+        input.rect,draw_style,SelectorType::Input,style_sheet,UIGeneratedPseudoKind::Before
+    );
+    struct VectorInputPseudoAfterScope {
+        UIElementBase& rect; const ComputedStyle& style; const StyleSheet& sheet;
+        ~VectorInputPseudoAfterScope() {
+            DrawGeneratedPseudoElement(rect,style,SelectorType::Input,sheet,UIGeneratedPseudoKind::After);
+        }
+    } vector_input_pseudo_after{input.rect,draw_style,style_sheet};
 
     constexpr int component_count =
         VectorComponentCount<T>;
@@ -5815,13 +8452,6 @@ inline void DrawVectorInput(
             ? content.width /
                 static_cast<float>(component_count)
             : 0.0f;
-
-    const char* labels[4] = {
-        "X",
-        "Y",
-        "Z",
-        "W"
-    };
 
     for(int index = 0; index < component_count; index++) {
         Rectangle component_rect = {
@@ -5862,45 +8492,34 @@ inline void DrawVectorInput(
                 input.component_buffers[index];
         }
         else if(component != nullptr) {
-            value_text =
-                TextFormat(
-                    "%s %.2f",
-                    labels[index],
-                    *component
-                );
+            value_text = TextFormat("%.2f",*component);
         }
 
-        Font font = ResolveUIFont(draw_style.font);
-        Vector2 text_size = MeasureTextCached(
-            font,
-            value_text.c_str(),
-            draw_style.font_size,
-            1.0f
+        const bool component_hovered =
+            input.hovered &&
+            CheckCollisionPointRec(GetUIMousePosition(),component_rect);
+        const bool component_active =
+            input.active_component == index &&
+            (input.active || input.dragging || input.focused);
+
+        DrawInputComponentText(
+            input,
+            style_sheet,
+            index,
+            component_rect,
+            value_text,
+            draw_style,
+            component_hovered,
+            component_active
         );
 
-        Vector2 text_position = {
-            component_rect.x +
-                (
-                    component_rect.width -
-                    text_size.x
-                ) * 0.5f,
-            component_rect.y +
-                (
-                    component_rect.height -
-                    text_size.y
-                ) * 0.5f
-        };
-
-        DrawTextEx(
-            font,
-            value_text.c_str(),
-            text_position,
-            draw_style.font_size,
-            1.0f,
-            ApplyStyleOpacity(draw_style.text_color,draw_style.opacity)
-        );
-
-        if(input.input_type == InputType::Drag) {
+        if(
+            input.input_type == InputType::Drag &&
+            !(
+                input.drag_text_editing &&
+                input.active_component == index
+            )
+        ) {
             DrawHorizontalDragArrows(
                 component_rect,
                 ApplyStyleOpacity(
@@ -5990,7 +8609,8 @@ void UpdateUIFrame(
     const StyleSheet& style_sheet,
     float width = -1.0f,
     float height = -1.0f,
-    bool force_layout = false
+    bool force_layout = false,
+    bool detect_layout_mutations = false
 );
 
 struct UIFocusEntry {
@@ -6026,7 +8646,16 @@ Rectangle TabItemRectangle(
     const UITabBar& tabs,
     std::size_t index
 );
-
+void EvaluateTransformMatrix(
+    ComputedStyle& style,
+    const Rectangle& bounds,
+    float parent_width,
+    float parent_height,
+    float font_size,
+    float root_font_size,
+    float viewport_width,
+    float viewport_height
+);
 void UpdateTabBar(UITabBar& tabs, bool inherited_disabled);
 
 void TranslateContainer(UIContainer& container, Vector2 delta);
@@ -6110,7 +8739,8 @@ void DrawElementsClippedInternal(
     const StyleSheet& style_sheet,
     Rectangle parent_clip,
     bool parent_clip_active,
-    UIDrawContext& context
+    UIDrawContext& context,
+    bool skip_current_composite=false
 );
 
 void DrawQueuedOverlays(
@@ -6149,3 +8779,200 @@ void DrawElements(
     const std::unordered_map<std::string,Font>& fonts,
     const StyleSheet& style_sheet
 );
+
+// ---------------------------------------------------------------------------
+// UIComponent generic lifecycle (RUI 0.9)
+// ---------------------------------------------------------------------------
+
+inline UIComponent::UIComponent() = default;
+
+inline void UIComponent::AssociateDescriptor(
+    const UIComponentDescriptor* descriptor,
+    const UIComponentRegistry* registry,
+    std::string component_name,
+    SelectorType selector,
+    std::uint32_t capability_bits,
+    bool accepts_visual_children
+) {
+    descriptor_ = descriptor;
+    registry_ = registry;
+    component_name_ = std::move(component_name);
+    selector_ = selector;
+    capability_bits_ = capability_bits;
+    // UIComponentCapability bit positions are intentionally stable public API.
+    focusable_ = (capability_bits_ & (1u << 0)) != 0;
+    clickable_ = (capability_bits_ & (1u << 1)) != 0;
+    draggable_ = (capability_bits_ & (1u << 2)) != 0;
+    keyboard_input_ = (capability_bits_ & (1u << 5)) != 0;
+    accepts_visual_children_ = accepts_visual_children;
+    if(accepts_visual_children_ && !children_) {
+        children_ = std::make_shared<UIContainer>();
+        children_->direction = LayoutDirection::Column;
+    }
+}
+
+inline UIContainer* UIComponent::ChildContainer() {
+    return accepts_visual_children_ ? children_.get() : nullptr;
+}
+
+inline const UIContainer* UIComponent::ChildContainer() const {
+    return accepts_visual_children_ ? children_.get() : nullptr;
+}
+
+inline Vector2 UIComponent::MeasureContent(float,float) const {
+    return {0.0f,0.0f};
+}
+
+inline void UIComponent::UpdateContent(bool) {}
+inline void UIComponent::DrawContent(const ComputedStyle&,Rectangle) {}
+
+inline Rectangle UIComponent::ContentBounds(const ComputedStyle& resolved_style) const {
+    Rectangle content = rect.transform;
+    content.x += resolved_style.padding.left;
+    content.y += resolved_style.padding.top;
+    content.width = std::max(
+        0.0f,
+        content.width-resolved_style.padding.left-resolved_style.padding.right
+    );
+    content.height = std::max(
+        0.0f,
+        content.height-resolved_style.padding.top-resolved_style.padding.bottom
+    );
+    return content;
+}
+
+inline Vector2 UIComponent::Measure(
+    const StyleSheet&,
+    float available_width,
+    float available_height
+) {
+    const float content_width = std::max(
+        0.0f,available_width-style.padding.left-style.padding.right
+    );
+    const float content_height = std::max(
+        0.0f,available_height-style.padding.top-style.padding.bottom
+    );
+    const Vector2 intrinsic = MeasureContent(content_width,content_height);
+    return {
+        std::max(0.0f,intrinsic.x)+style.padding.left+style.padding.right,
+        std::max(0.0f,intrinsic.y)+style.padding.top+style.padding.bottom
+    };
+}
+
+inline void UIComponent::Layout(const StyleSheet& style_sheet,Rectangle bounds) {
+    rect.transform = bounds;
+    if(!children_) return;
+    const Rectangle content = ContentBounds(style);
+    children_->rect.transform = content;
+    children_->rect.transform.width = content.width;
+    children_->rect.transform.height = content.height;
+    children_->inherited_scale = EffectiveComputedStyleScale(style);
+    LayoutContainer(
+        *children_,style_sheet,content.width,content.height,true
+    );
+}
+
+inline void UIComponent::Update(bool inherited_disabled) {
+    const bool effective_disabled = disabled || inherited_disabled;
+    rect.inherited_disabled = inherited_disabled;
+    const Vector2 mouse = GetUIMousePosition();
+    hovered_ = !effective_disabled && CheckCollisionPointRec(mouse,rect.transform);
+
+    if(effective_disabled) {
+        active_ = false;
+        dragging_ = false;
+    }
+    else {
+        if((clickable_ || draggable_) && hovered_ && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            active_ = true;
+            drag_origin_ = mouse;
+            last_drag_mouse_ = mouse;
+        }
+
+        if(draggable_ && active_ && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            const Vector2 total = {mouse.x-drag_origin_.x,mouse.y-drag_origin_.y};
+            if(!dragging_ && (std::abs(total.x) >= 3.0f || std::abs(total.y) >= 3.0f)) {
+                dragging_ = true;
+                OnDragStart(drag_origin_);
+                EmitGenericEvent("dragstart");
+            }
+            if(dragging_) {
+                const Vector2 delta = {mouse.x-last_drag_mouse_.x,mouse.y-last_drag_mouse_.y};
+                OnDrag(delta,total);
+                EmitGenericEvent("drag");
+                last_drag_mouse_ = mouse;
+            }
+        }
+
+        if(active_ && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            if(dragging_) {
+                OnDragEnd(mouse);
+                EmitGenericEvent("dragend");
+            }
+            else if(clickable_ && hovered_) {
+                OnClick();
+                EmitGenericEvent("click");
+            }
+            active_ = false;
+            dragging_ = false;
+        }
+    }
+
+    rect.pseudo_states.SetKnown("hover",hovered_);
+    rect.pseudo_states.SetKnown("active",active_);
+    rect.pseudo_states.SetKnown("focus",focused_);
+    rect.pseudo_states.SetKnown("disabled",effective_disabled);
+    rect.pseudo_states.Update();
+
+    UpdateContent(effective_disabled);
+    if(children_) UpdateElements(*children_,false,effective_disabled);
+}
+
+inline void UIComponent::Draw(const StyleSheet& style_sheet) {
+    if(style.display == DisplayType::None) return;
+    const bool effective_disabled = disabled || rect.inherited_disabled;
+    const ComputedStyle& draw_style = ResolveInteractiveStyleRef(
+        style_sheet,selector_,style,focused_,hovered_,active_,
+        effective_disabled,rect
+    );
+
+    const Color background = ApplyStyleOpacity(
+        draw_style.background_color,draw_style.opacity
+    );
+    if(background.a > 0) {
+        DrawRectangleRounded(
+            rect.transform,
+            ResolveUIBorderRoundness(rect.transform,draw_style.border_radius),
+            8,
+            background
+        );
+    }
+    const Color border = ApplyStyleOpacity(
+        draw_style.border_color,draw_style.opacity
+    );
+    DrawStyleBorder(rect.transform,draw_style,border,8);
+    DrawGeneratedPseudoElement(
+        rect,draw_style,selector_,style_sheet,UIGeneratedPseudoKind::Before
+    );
+
+    const Rectangle content = ContentBounds(draw_style);
+    BeginRegisteredStyleOverrides(draw_style);
+    DrawContent(draw_style,content);
+    EndRegisteredStyleOverrides();
+
+    if(children_) {
+        Rectangle clip = rect.transform;
+        if(draw_style.overflow == OverflowType::Visible) {
+            clip = {
+                0.0f,0.0f,
+                static_cast<float>(GetScreenWidth()),
+                static_cast<float>(GetScreenHeight())
+            };
+        }
+        DrawElementsClipped(*children_,style_sheet,clip);
+    }
+
+    DrawGeneratedPseudoElement(
+        rect,draw_style,selector_,style_sheet,UIGeneratedPseudoKind::After
+    );
+}

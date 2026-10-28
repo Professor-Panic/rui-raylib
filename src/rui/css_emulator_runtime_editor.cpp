@@ -69,7 +69,7 @@ bool UpdateRuntimeLayout(
         }
     }
 
-    const Vector2 mouse = GetMousePosition();
+    const Vector2 mouse = GetUIMousePosition();
     const bool prefer_containers =
         IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 

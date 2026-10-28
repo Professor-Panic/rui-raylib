@@ -1,6 +1,7 @@
 #include "css_emulator.h"
 
 #include <cstdlib>
+#include <filesystem>
 
 namespace {
 
@@ -26,19 +27,14 @@ Rectangle InsetRectangle(Rectangle rectangle, const EdgeValues& padding) {
 void DrawBasicElementBox(Rectangle rectangle, const ComputedStyle& style) {
     DrawRectangleRounded(
         rectangle,
-        style.border_radius,
+        ResolveUIBorderRoundness(rectangle,style.border_radius),
         8,
         ApplyStyleOpacity(style.background_color,style.opacity)
     );
-    if(style.border_width > 0.0f && style.border_color.a > 0) {
-        DrawRectangleRoundedLinesEx(
-            rectangle,
-            style.border_radius,
-            8,
-            style.border_width,
-            ApplyStyleOpacity(style.border_color,style.opacity)
-        );
-    }
+    DrawStyleBorder(
+        rectangle,style,
+        ApplyStyleOpacity(style.border_color,style.opacity),8
+    );
 }
 
 float TextLineHeight(const ComputedStyle& style, float line_spacing) {
@@ -272,14 +268,14 @@ void DrawDockNode(UIDockSpace& dock,const std::shared_ptr<UIDockNode>& node,cons
             tab,
             active ? dock.style.background_color : DarkenColor(dock.style.background_color,0.14f)
         );
-        DrawTextEx(
+        DrawUIText(
             font,panel->title.c_str(),
             {tab.x+8.0f,tab.y+(tab.height-dock.style.font_size)*0.5f},
             dock.style.font_size,1.0f,dock.style.text_color
         );
         if(panel->closable) {
             const Rectangle close = {tab.x+tab.width-20.0f,tab.y+4.0f,16.0f,tab.height-8.0f};
-            DrawTextEx(font,"x",{close.x+3.0f,close.y},dock.style.font_size,1.0f,dock.style.text_color);
+            DrawUIText(font,"x",{close.x+3.0f,close.y},dock.style.font_size,1.0f,dock.style.text_color);
         }
         x += width;
     }
@@ -502,7 +498,10 @@ UIDragDropContext& GetUIDragDropContext() {
 }
 
 void UIDragDropContext::BeginFrame() {
-    pointer_ = GetMousePosition();
+    // Drag/drop spans coordinate spaces (for example an asset browser into a
+    // Viewport), so the shared drag pointer and preview rectangles are always
+    // stored in physical screen coordinates.
+    pointer_ = ::GetMousePosition();
     preview_ = {};
     preview_target_.reset();
     released_this_frame_ = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
@@ -568,6 +567,8 @@ void UIDragDropContext::Cancel() {
 }
 
 void UpdateElementDragDrop(UIElementBase& element) {
+    if(!element.drag_source && !element.drop_target) return;
+
     UIDragDropContext& context = GetUIDragDropContext();
     if(element.drag_source) {
         UIDragSourceBinding& source = *element.drag_source;
@@ -577,15 +578,16 @@ void UpdateElementDragDrop(UIElementBase& element) {
         else {
             bool enabled = source.enabled;
             if(source.update_enabled) source.update_enabled(enabled);
-            const Vector2 mouse = GetMousePosition();
+            const Vector2 mouse = GetUIMousePosition();
+            const Vector2 screen_mouse = UITransformPointToScreen(mouse);
             const bool hovered = CheckCollisionPointRec(mouse,element.transform);
             if(!context.Dragging() && enabled && hovered && IsMouseButtonPressed(source.mouse_button)) {
                 source.pressed_inside = true;
-                source.press_origin = mouse;
+                source.press_origin = screen_mouse;
             }
             if(source.pressed_inside && IsMouseButtonDown(source.mouse_button)) {
-                const float dx = mouse.x-source.press_origin.x;
-                const float dy = mouse.y-source.press_origin.y;
+                const float dx = screen_mouse.x-source.press_origin.x;
+                const float dy = screen_mouse.y-source.press_origin.y;
                 if(dx*dx+dy*dy >= source.threshold*source.threshold && source.make_payload) {
                     UIDragPayload payload = source.make_payload();
                     const auto on_end_callback = source.on_end;
@@ -595,10 +597,10 @@ void UpdateElementDragDrop(UIElementBase& element) {
                         if(WeakCallbackExpired(source_lifetime_tracked,source_lifetime)) return;
                         if(on_end_callback) on_end_callback(accepted);
                     };
-                    if(context.BeginDrag(ElementRuntimeKey(element),std::move(payload),mouse,std::move(on_end))) {
+                    if(context.BeginDrag(ElementRuntimeKey(element),std::move(payload),screen_mouse,std::move(on_end))) {
                         source.pressed_inside = false;
                         if(source.on_begin) source.on_begin();
-                        element.pseudo_states.Set("dragging",true);
+                        element.pseudo_states.SetKnown("dragging",true);
                     }
                 }
             }
@@ -611,7 +613,11 @@ void UpdateElementDragDrop(UIElementBase& element) {
             element.drop_target.reset();
         }
         else {
-            context.ConsiderTarget(ElementRuntimeKey(element),element.transform,target);
+            context.ConsiderTarget(
+                ElementRuntimeKey(element),
+                UITransformRectangleToScreen(element.transform),
+                target
+            );
             element.pseudo_states.Set(
                 "drag-over",
                 context.Preview().target_key == ElementRuntimeKey(element) &&
@@ -619,7 +625,9 @@ void UpdateElementDragDrop(UIElementBase& element) {
             );
         }
     }
-    if(!context.Dragging()) element.pseudo_states.Set("dragging",false);
+    if(element.drag_source && !context.Dragging()) {
+        element.pseudo_states.SetKnown("dragging",false);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -788,48 +796,150 @@ std::size_t UITextBox::VisibleCharacterCount(double now) const {
     return std::min(text.size(),static_cast<std::size_t>(std::ceil(progress*static_cast<float>(text.size()))));
 }
 
+namespace {
+
+void NormalizeTextBoxSelection(UITextBox& box) {
+    box.caret = std::min(box.caret,box.text.size());
+    box.selection_anchor = std::min(box.selection_anchor,box.text.size());
+    box.selection_start = std::min(box.selection_anchor,box.caret);
+    box.selection_end = std::max(box.selection_anchor,box.caret);
+}
+
+void CollapseTextBoxSelection(UITextBox& box,std::size_t caret) {
+    box.caret = std::min(caret,box.text.size());
+    box.selection_anchor = box.caret;
+    box.selection_start = box.caret;
+    box.selection_end = box.caret;
+}
+
+bool DeleteTextBoxSelection(UITextBox& box) {
+    NormalizeTextBoxSelection(box);
+    if(box.selection_end <= box.selection_start) return false;
+    const std::size_t start = box.selection_start;
+    box.text.erase(start,box.selection_end-start);
+    CollapseTextBoxSelection(box,start);
+    return true;
+}
+
+std::size_t TextBoxCaretFromPoint(const UITextBox& box,Vector2 mouse) {
+    if(box.wrapped_lines.empty()) return 0;
+    const Rectangle content = InsetRectangle(box.rect.transform,box.style.padding);
+    const float line_height = TextLineHeight(box.style,box.line_spacing);
+    int line_index = static_cast<int>(std::floor(
+        (mouse.y-content.y+box.scroll_y)/std::max(line_height,1.0f)
+    ));
+    line_index = std::clamp(line_index,0,static_cast<int>(box.wrapped_lines.size())-1);
+    const UITextWrappedLine& line = box.wrapped_lines[static_cast<std::size_t>(line_index)];
+    Font font = ResolveUIFont(box.style.font);
+    const float local_x = mouse.x-content.x;
+    if(local_x <= 0.0f) return line.first_character;
+    float previous = 0.0f;
+    for(std::size_t index=1; index<=line.text.size(); ++index) {
+        const float width = MeasureTextCached(
+            font,line.text.substr(0,index).c_str(),box.style.font_size,1.0f
+        ).x;
+        if(local_x < (previous+width)*0.5f) return line.first_character+index-1;
+        previous = width;
+    }
+    return std::min(line.first_character+line.character_count,box.text.size());
+}
+
+} // namespace
+
 void UITextBox::Update(bool inherited_disabled) {
     changed = false;
     submitted = false;
     const bool blocked = disabled || inherited_disabled;
-    hovered = !blocked && CheckCollisionPointRec(GetMousePosition(),rect.transform);
+    const Vector2 mouse = GetUIMousePosition();
+    hovered = !blocked && CheckCollisionPointRec(mouse,rect.transform);
+
     if(editable && hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         focused = true;
-        caret = text.size();
+        const std::size_t next = TextBoxCaretFromPoint(*this,mouse);
+        const bool extend = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+        if(!extend) selection_anchor = next;
+        caret = next;
+        NormalizeTextBoxSelection(*this);
+        mouse_selecting = true;
     }
+    if(IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) mouse_selecting = false;
+    if(mouse_selecting && focused && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        caret = TextBoxCaretFromPoint(*this,mouse);
+        NormalizeTextBoxSelection(*this);
+    }
+
     if(!editable || blocked || !focused) return;
+
+    const bool control = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if(control && IsKeyPressed(KEY_A)) {
+        selection_anchor = 0;
+        caret = text.size();
+        NormalizeTextBoxSelection(*this);
+    }
+
+    auto moveCaret = [&](std::size_t next) {
+        next = std::min(next,text.size());
+        if(!shift) selection_anchor = next;
+        caret = next;
+        NormalizeTextBoxSelection(*this);
+    };
+
+    if(IsKeyPressed(KEY_HOME)) moveCaret(0);
+    else if(IsKeyPressed(KEY_END)) moveCaret(text.size());
+    else if(IsKeyPressed(KEY_LEFT)) {
+        if(!shift && selection_end > selection_start) moveCaret(selection_start);
+        else moveCaret(caret > 0 ? caret-1 : 0);
+    }
+    else if(IsKeyPressed(KEY_RIGHT)) {
+        if(!shift && selection_end > selection_start) moveCaret(selection_end);
+        else moveCaret(std::min(text.size(),caret+1));
+    }
 
     int character = GetCharPressed();
     while(character > 0) {
-        if(character >= 32 && text.size() < max_characters) {
-            text.insert(text.begin()+static_cast<std::ptrdiff_t>(caret),static_cast<char>(character));
-            ++caret;
-            changed = true;
+        if(character >= 32 && (selection_end > selection_start || text.size() < max_characters)) {
+            DeleteTextBoxSelection(*this);
+            if(text.size() < max_characters) {
+                text.insert(text.begin()+static_cast<std::ptrdiff_t>(caret),static_cast<char>(character));
+                CollapseTextBoxSelection(*this,caret+1);
+                changed = true;
+            }
         }
         character = GetCharPressed();
     }
-    if(IsKeyPressed(KEY_BACKSPACE) && caret > 0) {
-        text.erase(caret-1,1);
-        --caret;
-        changed = true;
-    }
-    if(IsKeyPressed(KEY_DELETE) && caret < text.size()) {
-        text.erase(caret,1);
-        changed = true;
-    }
-    if(IsKeyPressed(KEY_LEFT) && caret > 0) --caret;
-    if(IsKeyPressed(KEY_RIGHT) && caret < text.size()) ++caret;
-    if(IsKeyPressed(KEY_HOME)) caret = 0;
-    if(IsKeyPressed(KEY_END)) caret = text.size();
-    if(IsKeyPressed(KEY_ENTER)) {
-        if(multiline && !IsKeyDown(KEY_LEFT_CONTROL) && text.size() < max_characters) {
-            text.insert(text.begin()+static_cast<std::ptrdiff_t>(caret),'\n');
-            ++caret;
+
+    if(IsKeyPressed(KEY_BACKSPACE)) {
+        if(DeleteTextBoxSelection(*this)) changed = true;
+        else if(caret > 0) {
+            text.erase(caret-1,1);
+            CollapseTextBoxSelection(*this,caret-1);
             changed = true;
+        }
+    }
+    if(IsKeyPressed(KEY_DELETE)) {
+        if(DeleteTextBoxSelection(*this)) changed = true;
+        else if(caret < text.size()) {
+            text.erase(caret,1);
+            CollapseTextBoxSelection(*this,caret);
+            changed = true;
+        }
+    }
+    if(IsKeyPressed(KEY_ENTER)) {
+        if(multiline && !control && (selection_end > selection_start || text.size() < max_characters)) {
+            DeleteTextBoxSelection(*this);
+            if(text.size() < max_characters) {
+                text.insert(text.begin()+static_cast<std::ptrdiff_t>(caret),'\n');
+                CollapseTextBoxSelection(*this,caret+1);
+                changed = true;
+            }
         }
         else submitted = true;
     }
-    if(IsKeyPressed(KEY_ESCAPE)) focused = false;
+    if(IsKeyPressed(KEY_ESCAPE)) {
+        focused = false;
+        mouse_selecting = false;
+    }
     if(changed) {
         wrapped_lines.clear();
         if(on_change) on_change(*this);
@@ -838,12 +948,12 @@ void UITextBox::Update(bool inherited_disabled) {
 }
 
 void UITextBox::Draw(const StyleSheet& style_sheet) {
-    rect.pseudo_states.Set("focus",focused);
-    rect.pseudo_states.Set("hover",hovered);
-    rect.pseudo_states.Set("disabled",disabled || rect.inherited_disabled);
+    rect.pseudo_states.SetKnown("focus",focused);
+    rect.pseudo_states.SetKnown("hover",hovered);
+    rect.pseudo_states.SetKnown("disabled",disabled || rect.inherited_disabled);
     rect.pseudo_states.Update();
     ComputedStyle draw_style = ResolveStyleWithPseudoStates(
-        style_sheet,SelectorType::TextBox,style.id,rect.pseudo_states.ActiveNames(),style
+        style_sheet,SelectorType::TextBox,style.id,rect.pseudo_states.ActiveNamesView(),style
     );
     draw_style = ResolveAnimatedStyle(rect,style_sheet,std::move(draw_style),"textbox");
     DrawBasicElementBox(rect.transform,draw_style);
@@ -855,10 +965,32 @@ void UITextBox::Draw(const StyleSheet& style_sheet) {
     const double now = GetTime();
     const std::size_t visible = VisibleCharacterCount(now);
     Font font = ResolveUIFont(draw_style.font);
+    NormalizeTextBoxSelection(*this);
     float y = content.y-scroll_y;
     const float line_height = TextLineHeight(draw_style,line_spacing);
     for(const UITextWrappedLine& line : wrapped_lines) {
         if(y+line_height >= content.y && y <= content.y+content.height) {
+            if(editable && focused && selection_end > selection_start) {
+                const std::size_t line_start = line.first_character;
+                const std::size_t line_end = line.first_character+line.character_count;
+                const std::size_t selected_start = std::max(selection_start,line_start);
+                const std::size_t selected_end = std::min(selection_end,line_end);
+                if(selected_end > selected_start) {
+                    const std::size_t local_start = selected_start-line_start;
+                    const std::size_t local_end = selected_end-line_start;
+                    const float selection_x = MeasureTextCached(
+                        font,line.text.substr(0,local_start).c_str(),draw_style.font_size,1.0f
+                    ).x;
+                    const float selection_end_x = MeasureTextCached(
+                        font,line.text.substr(0,local_end).c_str(),draw_style.font_size,1.0f
+                    ).x;
+                    const UIFontVerticalExtent extent = MeasureFontVerticalExtent(font,draw_style.font_size);
+                    DrawRectangleRec(
+                        {content.x+selection_x,y+extent.top-1.0f,std::max(2.0f,selection_end_x-selection_x),extent.Height()+2.0f},
+                        Color{80,140,255,110}
+                    );
+                }
+            }
             std::size_t count = line.character_count;
             if(line.first_character >= visible) count = 0;
             else count = std::min(count,visible-line.first_character);
@@ -870,7 +1002,7 @@ void UITextBox::Draw(const StyleSheet& style_sheet) {
                     const float phase = static_cast<float>(now-text_animation.started)*text_animation.wave_frequency+
                         static_cast<float>(line.first_character+index)*0.45f;
                     const float offset = std::sin(phase)*text_animation.wave_amplitude;
-                    DrawTextEx(font,glyph.c_str(),{x,y+offset},draw_style.font_size,1.0f,base_color);
+                    DrawUIText(font,glyph.c_str(),{x,y+offset},draw_style.font_size,1.0f,base_color);
                     x += MeasureTextCached(font,glyph.c_str(),draw_style.font_size,1.0f).x;
                 }
             }
@@ -883,7 +1015,7 @@ void UITextBox::Draw(const StyleSheet& style_sheet) {
                     const float alpha = std::clamp(newest_age/std::max(0.001f,text_animation.stagger*4.0f),0.0f,1.0f);
                     color = ApplyStyleOpacity(color,alpha);
                 }
-                DrawTextEx(font,shown.c_str(),{content.x,y},draw_style.font_size,1.0f,color);
+                DrawUIText(font,shown.c_str(),{content.x,y},draw_style.font_size,1.0f,color);
             }
         }
         y += line_height;
@@ -902,7 +1034,12 @@ void UITextBox::Draw(const StyleSheet& style_sheet) {
             }
         }
         const float caret_y = content.y+static_cast<float>(line_index)*line_height-scroll_y;
-        DrawLineEx({caret_x,caret_y},{caret_x,caret_y+draw_style.font_size},1.0f,base_color);
+        const UIFontVerticalExtent extent = MeasureFontVerticalExtent(font,draw_style.font_size);
+        DrawLineEx(
+            {caret_x,caret_y+extent.top-1.0f},
+            {caret_x,caret_y+extent.bottom+1.0f},
+            1.0f,base_color
+        );
     }
 }
 
@@ -911,6 +1048,10 @@ void UITextBox::ReconcileFrom(IUICustomElement& previous,const UIReconcileOption
     if(!old) return;
     focused = old->focused;
     caret = old->caret;
+    selection_anchor = old->selection_anchor;
+    selection_start = old->selection_start;
+    selection_end = old->selection_end;
+    mouse_selecting = old->mouse_selecting;
     scroll_y = old->scroll_y;
     const bool incoming_text_changed = text != old->text;
     if(options.preserve_values) {
@@ -924,6 +1065,9 @@ void UITextBox::ReconcileFrom(IUICustomElement& previous,const UIReconcileOption
         PlayTextAnimation(true);
     }
     caret = std::min(caret,text.size());
+    selection_anchor = std::min(selection_anchor,text.size());
+    selection_start = std::min(selection_start,text.size());
+    selection_end = std::min(selection_end,text.size());
 }
 
 // -----------------------------------------------------------------------------
@@ -970,7 +1114,7 @@ void UITable::Layout(const StyleSheet&,Rectangle bounds) { rect.transform = boun
 
 void UITable::Update(bool inherited_disabled) {
     const bool disabled = inherited_disabled;
-    const Vector2 mouse = GetMousePosition();
+    const Vector2 mouse = GetUIMousePosition();
     const bool hovered = !disabled && CheckCollisionPointRec(mouse,rect.transform);
     hovered_row = -1;
     if(hovered) {
@@ -1037,7 +1181,7 @@ void UITable::Update(bool inherited_disabled) {
 
 void UITable::Draw(const StyleSheet& style_sheet) {
     ComputedStyle draw_style = ResolveStyleWithPseudoStates(
-        style_sheet,SelectorType::Table,style.id,rect.pseudo_states.ActiveNames(),style
+        style_sheet,SelectorType::Table,style.id,rect.pseudo_states.ActiveNamesView(),style
     );
     draw_style = ResolveAnimatedStyle(rect,style_sheet,std::move(draw_style),"table");
     DrawBasicElementBox(rect.transform,draw_style);
@@ -1047,14 +1191,14 @@ void UITable::Draw(const StyleSheet& style_sheet) {
         const UITableColumn& column = columns[column_index];
         Rectangle header = {x,rect.transform.y,column.width,header_height};
         DrawRectangleRec(header,DarkenColor(draw_style.background_color,0.10f));
-        DrawTextEx(
+        DrawUIText(
             font,column.title.c_str(),
             {header.x+6.0f,header.y+(header.height-draw_style.font_size)*0.5f},
             draw_style.font_size,1.0f,draw_style.text_color
         );
         if(sort_column == static_cast<int>(column_index)) {
             const char* arrow = sort_ascending ? "^" : "v";
-            DrawTextEx(font,arrow,{header.x+header.width-14.0f,header.y+5.0f},draw_style.font_size,1.0f,draw_style.text_color);
+            DrawUIText(font,arrow,{header.x+header.width-14.0f,header.y+5.0f},draw_style.font_size,1.0f,draw_style.text_color);
         }
         DrawLineEx({header.x+header.width,header.y},{header.x+header.width,header.y+rect.transform.height},1.0f,draw_style.border_color);
         x += column.width;
@@ -1080,7 +1224,7 @@ void UITable::Draw(const StyleSheet& style_sheet) {
             float text_x = cell_x+6.0f;
             if(column.alignment == TextAlign::Center) text_x = cell_x+(column.width-measured.x)*0.5f;
             else if(column.alignment == TextAlign::Right) text_x = cell_x+column.width-measured.x-6.0f;
-            DrawTextEx(font,value.c_str(),{text_x,y+(row_height-draw_style.font_size)*0.5f},draw_style.font_size,1.0f,row.disabled?ApplyStyleOpacity(draw_style.text_color,0.45f):draw_style.text_color);
+            DrawUIText(font,value.c_str(),{text_x,y+(row_height-draw_style.font_size)*0.5f},draw_style.font_size,1.0f,row.disabled?ApplyStyleOpacity(draw_style.text_color,0.45f):draw_style.text_color);
             cell_x += column.width;
         }
     }
@@ -1110,27 +1254,247 @@ void UITable::ReconcileFrom(IUICustomElement& previous,const UIReconcileOptions&
 // Virtual list
 // -----------------------------------------------------------------------------
 
-UIVirtualList& UIVirtualList::Items(std::vector<std::string> values) { items = std::move(values); return *this; }
-UIVirtualList& UIVirtualList::ItemHeight(float value) { item_height = std::max(1.0f,value); return *this; }
-UIVirtualList& UIVirtualList::Overscan(std::size_t value) { overscan = value; return *this; }
-UIVirtualList& UIVirtualList::OnSelect(std::function<void(UIVirtualList&,std::size_t)> callback) { on_select = std::move(callback); return *this; }
+UIVirtualList& UIVirtualList::Items(std::vector<std::string> values) {
+    items = std::move(values);
+    virtual_item_count = 0;
+    build_visible_items = {};
+    content = {};
+    built_range_valid_ = false;
+    return *this;
+}
+
+UIVirtualList& UIVirtualList::VirtualItems(
+    std::size_t count,
+    BuildVisibleItems builder
+) {
+    virtual_item_count = count;
+    build_visible_items = std::move(builder);
+    items.clear();
+    content = {};
+    built_range_valid_ = false;
+    return *this;
+}
+
+UIVirtualList& UIVirtualList::ItemHeight(float value) {
+    item_height = std::max(1.0f,value);
+    built_range_valid_ = false;
+    return *this;
+}
+
+UIVirtualList& UIVirtualList::Overscan(std::size_t value) {
+    overscan = value;
+    built_range_valid_ = false;
+    return *this;
+}
+
+UIVirtualList& UIVirtualList::OnSelect(
+    std::function<void(UIVirtualList&,std::size_t)> callback
+) {
+    on_select = std::move(callback);
+    return *this;
+}
+
 UIVisibleRange UIVirtualList::VisibleItems() const {
-    return ComputeUIVisibleRange(items.size(),item_height,scroll_y,rect.transform.height,overscan);
+    return ComputeUIVisibleRange(
+        ItemCount(),
+        item_height,
+        scroll_y,
+        rect.transform.height,
+        overscan
+    );
 }
-Vector2 UIVirtualList::Measure(const StyleSheet&,float available_width,float available_height) {
-    return {available_width,std::min(available_height,item_height*static_cast<float>(items.size()))};
+
+Vector2 UIVirtualList::Measure(
+    const StyleSheet&,
+    float available_width,
+    float available_height
+) {
+    return {
+        available_width,
+        std::min(
+            available_height,
+            item_height*static_cast<float>(ItemCount())
+        )
+    };
 }
-void UIVirtualList::Layout(const StyleSheet&,Rectangle bounds) { rect.transform = bounds; }
+
+void UIVirtualList::RebuildVisibleContent(
+    std::size_t first,
+    std::size_t last
+) {
+    if(!UsesTemplate()) return;
+
+    UIContainer rebuilt;
+    rebuilt.direction = FlexDirection::Column;
+    rebuilt.style.display = DisplayType::Flex;
+    rebuilt.style.flex_direction = FlexDirection::Column;
+    rebuilt.style.overflow = OverflowType::Scroll;
+    rebuilt.style.gap = 0.0f;
+    rebuilt.style.row_gap = 0.0f;
+    rebuilt.style.column_gap = 0.0f;
+    rebuilt.style.gap_length = CSSLength{0.0f,LengthUnit::Pixels};
+    rebuilt.style.row_gap_length = CSSLength{0.0f,LengthUnit::Pixels};
+    rebuilt.style.column_gap_length = CSSLength{0.0f,LengthUnit::Pixels};
+    rebuilt.show_scrollbars = false;
+
+    auto add_spacer = [&](float height, const char* suffix) {
+        if(height <= 0.0f) return;
+
+        UIContainer spacer;
+        spacer.direction = FlexDirection::Column;
+        spacer.style.display = DisplayType::Block;
+        spacer.style.width_length = CSSLength{100.0f,LengthUnit::Percent};
+        spacer.style.height = height;
+        spacer.style.height_length = CSSLength{height,LengthUnit::Pixels};
+        spacer.style.min_height = height;
+        spacer.style.max_height = height;
+        spacer.style.min_height_length = CSSLength{height,LengthUnit::Pixels};
+        spacer.style.max_height_length = CSSLength{height,LengthUnit::Pixels};
+        spacer.style.flex_grow = 0.0f;
+        spacer.style.flex_shrink = 0.0f;
+        spacer.rect.key = std::string("__virtual-list-")+suffix;
+        rebuilt.Add(std::move(spacer));
+    };
+
+    add_spacer(static_cast<float>(first)*item_height,"before");
+    build_visible_items(*this,rebuilt,first,last);
+
+    const std::size_t count = ItemCount();
+    add_spacer(static_cast<float>(count-last)*item_height,"after");
+
+    UIReconcileOptions reconcile;
+    reconcile.preserve_values = false;
+    reconcile.preserve_selection = true;
+    reconcile.preserve_open_state = true;
+    reconcile.preserve_runtime_layout = true;
+    reconcile.match_unkeyed_by_index = true;
+    ReconcileUI(content,std::move(rebuilt),reconcile);
+
+    built_first_ = first;
+    built_last_ = last;
+    built_range_valid_ = true;
+}
+
+void UIVirtualList::Layout(
+    const StyleSheet& style_sheet,
+    Rectangle bounds
+) {
+    rect.transform = bounds;
+
+    const float maximum = std::max(
+        0.0f,
+        item_height*static_cast<float>(ItemCount())-rect.transform.height
+    );
+    scroll_y = std::clamp(scroll_y,0.0f,maximum);
+
+    if(!UsesTemplate()) return;
+
+    const UIVisibleRange range = VisibleItems();
+    const std::size_t first = range.empty ? 0 : range.first;
+    const std::size_t last = range.empty ? 0 : range.last;
+
+    if(!built_range_valid_ || first != built_first_ || last != built_last_) {
+        RebuildVisibleContent(first,last);
+    }
+
+    content.rect.transform = bounds;
+    content.style.width = bounds.width;
+    content.style.height = bounds.height;
+    content.style.width_length = CSSLength{bounds.width,LengthUnit::Pixels};
+    content.style.height_length = CSSLength{bounds.height,LengthUnit::Pixels};
+    content.style.min_width = bounds.width;
+    content.style.max_width = bounds.width;
+    content.style.min_height = bounds.height;
+    content.style.max_height = bounds.height;
+    content.style.min_width_length = CSSLength{bounds.width,LengthUnit::Pixels};
+    content.style.max_width_length = CSSLength{bounds.width,LengthUnit::Pixels};
+    content.style.min_height_length = CSSLength{bounds.height,LengthUnit::Pixels};
+    content.style.max_height_length = CSSLength{bounds.height,LengthUnit::Pixels};
+    content.scroll.y = scroll_y;
+    content.show_scrollbars = false;
+
+    MarkLayoutDirty(content,false);
+    LayoutContainer(content,style_sheet,bounds.width,bounds.height,true);
+    scroll_y = content.scroll.y;
+}
+
 void UIVirtualList::Update(bool inherited_disabled) {
     const bool blocked = disabled || inherited_disabled;
-    const Vector2 mouse = GetMousePosition();
+    const Vector2 mouse = GetUIMousePosition();
     const bool hovered = !blocked && CheckCollisionPointRec(mouse,rect.transform);
     hovered_index = -1;
+
+    if(UsesTemplate()) {
+        if(
+            hovered &&
+            !CSS_UI_POINTER_INPUT_CONSUMED &&
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+        ) {
+            focused_ = true;
+            UpdatePointerFocus(content);
+        }
+
+        if(focused_ && IsKeyPressed(KEY_TAB)) {
+            AdvanceKeyboardFocus(content);
+        }
+
+        const bool pointer_consumed_before = CSS_UI_POINTER_INPUT_CONSUMED;
+        const bool continuing_pointer_sequence =
+            !IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+            (
+                IsMouseButtonDown(MOUSE_BUTTON_LEFT) ||
+                IsMouseButtonReleased(MOUSE_BUTTON_LEFT)
+            );
+
+        // Overscan rows intentionally exist outside the list viewport. Block new
+        // pointer hits there, but still let an already-started drag receive its
+        // down/release frames when the cursor leaves the viewport.
+        if(!hovered && !continuing_pointer_sequence) {
+            CSS_UI_POINTER_INPUT_CONSUMED = true;
+        }
+
+        const float previous_scroll = content.scroll.y;
+        UpdateElements(content,false,blocked);
+        scroll_y = content.scroll.y;
+        CSS_UI_POINTER_INPUT_CONSUMED = pointer_consumed_before;
+
+        if(std::abs(scroll_y-previous_scroll) > kEpsilon) {
+            CSS_UI_LAYOUT_CHANGE_REQUESTED = true;
+        }
+
+        if(hovered) {
+            const int index = static_cast<int>(std::floor(
+                (mouse.y-rect.transform.y+scroll_y)/item_height
+            ));
+            if(index >= 0 && index < static_cast<int>(ItemCount())) {
+                hovered_index = index;
+                if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                    selected_index = index;
+                    if(on_select) on_select(*this,static_cast<std::size_t>(index));
+                }
+            }
+        }
+        return;
+    }
+
     if(!hovered) return;
-    const float maximum = std::max(0.0f,item_height*static_cast<float>(items.size())-rect.transform.height);
+
+    const float maximum = std::max(
+        0.0f,
+        item_height*static_cast<float>(items.size())-rect.transform.height
+    );
     const float wheel = GetMouseWheelMove();
-    if(std::abs(wheel) > kEpsilon) scroll_y = std::clamp(scroll_y-wheel*item_height*3.0f,0.0f,maximum);
-    const int index = static_cast<int>(std::floor((mouse.y-rect.transform.y+scroll_y)/item_height));
+    if(std::abs(wheel) > kEpsilon) {
+        scroll_y = std::clamp(
+            scroll_y-wheel*item_height*3.0f,
+            0.0f,
+            maximum
+        );
+    }
+
+    const int index = static_cast<int>(std::floor(
+        (mouse.y-rect.transform.y+scroll_y)/item_height
+    ));
     if(index >= 0 && index < static_cast<int>(items.size())) {
         hovered_index = index;
         if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -1140,12 +1504,22 @@ void UIVirtualList::Update(bool inherited_disabled) {
         }
     }
 }
+
 void UIVirtualList::Draw(const StyleSheet& style_sheet) {
     ComputedStyle draw_style = ResolveStyleWithPseudoStates(
-        style_sheet,SelectorType::VirtualList,style.id,rect.pseudo_states.ActiveNames(),style
+        style_sheet,SelectorType::VirtualList,style.id,
+        rect.pseudo_states.ActiveNamesView(),style
     );
-    draw_style = ResolveAnimatedStyle(rect,style_sheet,std::move(draw_style),"virtual-list");
+    draw_style = ResolveAnimatedStyle(
+        rect,style_sheet,std::move(draw_style),"virtual-list"
+    );
     DrawBasicElementBox(rect.transform,draw_style);
+
+    if(UsesTemplate()) {
+        DrawElementsClipped(content,style_sheet,rect.transform);
+        return;
+    }
+
     Font font = ResolveUIFont(draw_style.font);
     const UIVisibleRange range = VisibleItems();
     if(range.empty) return;
@@ -1166,7 +1540,7 @@ void UIVirtualList::Draw(const StyleSheet& style_sheet) {
                 : (index%2 ? DarkenColor(draw_style.background_color,0.035f) : draw_style.background_color);
             if(hovered_index == static_cast<int>(index)) background = LightenColor(background,0.06f);
             DrawRectangleRec(item_rectangle,background);
-            DrawTextEx(
+            DrawUIText(
                 font,items[index].c_str(),
                 {item_rectangle.x+draw_style.padding.left,
                  item_rectangle.y+(item_height-draw_style.font_size)*0.5f},
@@ -1175,12 +1549,24 @@ void UIVirtualList::Draw(const StyleSheet& style_sheet) {
         }
     }
 }
+
+UIElementBase* UIVirtualList::FindNestedElement(const std::string& key) {
+    return UsesTemplate() ? FindUIElementByKey(content,key) : nullptr;
+}
+
+const UIElementBase* UIVirtualList::FindNestedElement(const std::string& key) const {
+    return UsesTemplate() ? FindUIElementByKey(content,key) : nullptr;
+}
+
 void UIVirtualList::ReconcileFrom(IUICustomElement& previous,const UIReconcileOptions& options) {
     auto* old = dynamic_cast<UIVirtualList*>(&previous);
     if(!old) return;
     scroll_y = old->scroll_y;
     focused_ = old->focused_;
     if(options.preserve_selection) selected_index = old->selected_index;
+    // The new RXML builder owns fresh scopes/bindings. Rebuild the visible
+    // content on the next layout instead of retaining old callback closures.
+    built_range_valid_ = false;
 }
 
 // -----------------------------------------------------------------------------
@@ -1192,6 +1578,61 @@ UIDockSpace::UIDockSpace() {
     root->id = next_node_id_++;
     style.display = DisplayType::Block;
     style.overflow = OverflowType::Hidden;
+}
+
+UIDockSpace::~UIDockSpace() {
+    if(persist_layout && save_layout_on_exit && layout_dirty_) {
+        SaveLayoutFile();
+    }
+}
+
+bool UIDockSpace::SaveLayoutFile() const {
+    if(layout_file.empty()) return false;
+    const std::filesystem::path path(layout_file);
+    std::error_code error;
+    if(path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path(),error);
+        if(error) return false;
+    }
+    std::ofstream stream(path,std::ios::binary|std::ios::trunc);
+    if(!stream) return false;
+    std::string safe_id = layout_id;
+    std::replace(safe_id.begin(),safe_id.end(),'\n',' ');
+    std::replace(safe_id.begin(),safe_id.end(),'\r',' ');
+    stream << "RUI_DOCK_LAYOUT_V1\n"
+           << "id=" << safe_id << "\n"
+           << "layout=" << SerializeLayout() << "\n";
+    return static_cast<bool>(stream);
+}
+
+bool UIDockSpace::LoadLayoutFile() {
+    if(layout_file.empty()) return false;
+    std::ifstream stream(layout_file,std::ios::binary);
+    if(!stream) return false;
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    std::string source = buffer.str();
+    std::string serialized = source;
+    if(source.rfind("RUI_DOCK_LAYOUT_V1",0) == 0) {
+        std::istringstream lines(source);
+        std::string line;
+        std::string file_id;
+        serialized.clear();
+        while(std::getline(lines,line)) {
+            if(line.rfind("id=",0) == 0) file_id = line.substr(3);
+            else if(line.rfind("layout=",0) == 0) serialized = line.substr(7);
+        }
+        if(!file_id.empty() && file_id != layout_id) return false;
+    }
+    const bool loaded = !serialized.empty() && DeserializeLayout(serialized);
+    if(loaded) layout_dirty_ = false;
+    return loaded;
+}
+
+void UIDockSpace::NotifyLayoutChanged() {
+    layout_dirty_ = true;
+    if(persist_layout && save_layout_on_change) SaveLayoutFile();
+    if(on_layout_changed) on_layout_changed(*this);
 }
 
 UIDockPanel* UIDockSpace::FindPanel(const std::string& panel_id) {
@@ -1238,7 +1679,9 @@ bool UIDockSpace::RemovePanel(const std::string& panel_id) {
     panels.erase(std::remove_if(panels.begin(),panels.end(),[&](const UIDockPanel& panel) { return panel.id == panel_id; }),panels.end());
     RemoveDockTab(root,panel_id);
     NormalizeLayout();
-    return before != panels.size();
+    const bool removed = before != panels.size();
+    if(removed) NotifyLayoutChanged();
+    return removed;
 }
 
 bool UIDockSpace::DockPanel(const std::string& panel_id,std::uint64_t target_node,UIDockDropZone zone) {
@@ -1268,7 +1711,7 @@ bool UIDockSpace::DockPanel(const std::string& panel_id,std::uint64_t target_nod
     }
     NormalizeLayout();
     CSS_UI_LAYOUT_CHANGE_REQUESTED = true;
-    if(on_layout_changed) on_layout_changed(*this);
+    NotifyLayoutChanged();
     return true;
 }
 
@@ -1279,7 +1722,7 @@ bool UIDockSpace::UndockPanel(const std::string& panel_id,Rectangle floating_rec
     panel->floating = true;
     panel->floating_rectangle = floating_rectangle;
     NormalizeLayout();
-    if(on_layout_changed) on_layout_changed(*this);
+    NotifyLayoutChanged();
     return true;
 }
 
@@ -1292,6 +1735,7 @@ bool UIDockSpace::SelectPanel(const std::string& panel_id) {
             selected = true;
         }
     });
+    if(selected) NotifyLayoutChanged();
     return selected;
 }
 
@@ -1341,7 +1785,40 @@ void UIDockSpace::Layout(const StyleSheet& style_sheet,Rectangle bounds) {
 
 void UIDockSpace::Update(bool inherited_disabled) {
     if(inherited_disabled) return;
-    const Vector2 mouse = GetMousePosition();
+
+    // An overlay can own pointer input while still living inside a dock panel.
+    // ComboBox is the important case: the popup capture intentionally prevents
+    // click-through, but the panel subtree must keep updating so the owning combo
+    // can select an item, dismiss on an outside click, or process Escape.
+    //
+    // While captured, skip DockSpace's own tabs/splitters/floating-window chrome
+    // and update only panel contents. CSS_UI_POINTER_INPUT_CONSUMED remains set,
+    // so UpdateElements blocks every underlying control except g_open_combo.
+    if(CSS_UI_POINTER_INPUT_CONSUMED) {
+        for(UIDockPanel& panel : panels) {
+            if(panel.floating && panel.open) {
+                UpdateElements(panel.content,false,false);
+            }
+        }
+
+        VisitDockNodes(root,[&](UIDockNode& node) {
+            if(node.type != UIDockNodeType::Leaf || node.tabs.empty()) return;
+            const int active = std::clamp(
+                node.active_tab,
+                0,
+                static_cast<int>(node.tabs.size())-1
+            );
+            UIDockPanel* panel = FindPanel(
+                node.tabs[static_cast<std::size_t>(active)]
+            );
+            if(panel && panel->open && !panel->floating) {
+                UpdateElements(panel->content,false,false);
+            }
+        });
+        return;
+    }
+
+    const Vector2 mouse = GetUIMousePosition();
     UIDragDropContext& drag = GetUIDragDropContext();
 
     VisitDockNodes(root,[&](UIDockNode& node) {
@@ -1364,7 +1841,7 @@ void UIDockSpace::Update(bool inherited_disabled) {
                 }
                 else {
                     resizing_node_ = 0;
-                    if(on_layout_changed) on_layout_changed(*this);
+                    NotifyLayoutChanged();
                 }
             }
             return;
@@ -1384,10 +1861,13 @@ void UIDockSpace::Update(bool inherited_disabled) {
                     RemoveDockTab(root,panel->id);
                     NormalizeLayout();
                     CSS_UI_LAYOUT_CHANGE_REQUESTED = true;
-                    if(on_layout_changed) on_layout_changed(*this);
+                    NotifyLayoutChanged();
                 }
                 else {
-                    node.active_tab = static_cast<int>(index);
+                    if(node.active_tab != static_cast<int>(index)) {
+                        node.active_tab = static_cast<int>(index);
+                        NotifyLayoutChanged();
+                    }
                     pressed_panel_ = panel->id;
                     press_origin_ = mouse;
                 }
@@ -1410,7 +1890,7 @@ void UIDockSpace::Update(bool inherited_disabled) {
                     if(!accepted && !dragging_panel.empty()) {
                         UndockPanel(
                             dragging_panel,
-                            {GetMousePosition().x-80.0f,GetMousePosition().y-14.0f,420.0f,320.0f}
+                            {GetUIMousePosition().x-80.0f,GetUIMousePosition().y-14.0f,420.0f,320.0f}
                         );
                     }
                     dragging_panel.clear();
@@ -1457,7 +1937,7 @@ void UIDockSpace::Update(bool inherited_disabled) {
         if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             if(panel.closable && CheckCollisionPointRec(mouse,close)) {
                 panel.open = false;
-                if(on_layout_changed) on_layout_changed(*this);
+                NotifyLayoutChanged();
                 continue;
             }
             if(CheckCollisionPointRec(mouse,resize)) {
@@ -1478,7 +1958,7 @@ void UIDockSpace::Update(bool inherited_disabled) {
             }
             else {
                 panel.dragging = false;
-                if(on_layout_changed) on_layout_changed(*this);
+                NotifyLayoutChanged();
             }
         }
         if(panel.resizing) {
@@ -1489,7 +1969,7 @@ void UIDockSpace::Update(bool inherited_disabled) {
             }
             else {
                 panel.resizing = false;
-                if(on_layout_changed) on_layout_changed(*this);
+                NotifyLayoutChanged();
             }
         }
         UpdateElements(panel.content,false,false);
@@ -1504,7 +1984,7 @@ void UIDockSpace::Update(bool inherited_disabled) {
 
 void UIDockSpace::Draw(const StyleSheet& style_sheet) {
     ComputedStyle draw_style = ResolveStyleWithPseudoStates(
-        style_sheet,SelectorType::DockSpace,style.id,rect.pseudo_states.ActiveNames(),style
+        style_sheet,SelectorType::DockSpace,style.id,rect.pseudo_states.ActiveNamesView(),style
     );
     draw_style = ResolveAnimatedStyle(rect,style_sheet,std::move(draw_style),"dockspace");
     DrawBasicElementBox(rect.transform,draw_style);
@@ -1517,13 +1997,13 @@ void UIDockSpace::Draw(const StyleSheet& style_sheet) {
             DarkenColor(draw_style.background_color,0.08f)
         );
         Font font = ResolveUIFont(draw_style.font);
-        DrawTextEx(
+        DrawUIText(
             font,panel.title.c_str(),
             {panel.floating_rectangle.x+8.0f,panel.floating_rectangle.y+(tab_height-draw_style.font_size)*0.5f},
             draw_style.font_size,1.0f,draw_style.text_color
         );
         if(panel.closable) {
-            DrawTextEx(
+            DrawUIText(
                 font,"x",
                 {panel.floating_rectangle.x+panel.floating_rectangle.width-18.0f,panel.floating_rectangle.y+4.0f},
                 draw_style.font_size,1.0f,draw_style.text_color
@@ -1570,12 +2050,32 @@ void UIDockSpace::ReconcileFrom(IUICustomElement& previous,const UIReconcileOpti
     if(!old) return;
     root = old->root;
     next_node_id_ = old->next_node_id_;
+
+    // Rebuilds can happen immediately after the mouse press that begins a
+    // splitter/panel resize. Preserve the complete interaction transaction so
+    // reconciliation does not cancel resizing on the following frame.
+    pressed_panel_ = old->pressed_panel_;
+    press_origin_ = old->press_origin_;
+    resizing_node_ = old->resizing_node_;
+    resize_start_ratio_ = old->resize_start_ratio_;
+    resize_origin_ = old->resize_origin_;
+    dragging_panel = old->dragging_panel;
+    preview_zone = old->preview_zone;
+    preview_node = old->preview_node;
+
+    layout_dirty_ = old->layout_dirty_;
+    old->layout_dirty_ = false;
     for(UIDockPanel& panel : panels) {
         UIDockPanel* old_panel = old->FindPanel(panel.id);
         if(!old_panel) continue;
         panel.open = old_panel->open;
         panel.floating = old_panel->floating;
         panel.floating_rectangle = old_panel->floating_rectangle;
+        panel.dragging = old_panel->dragging;
+        panel.resizing = old_panel->resizing;
+        panel.drag_anchor = old_panel->drag_anchor;
+        panel.resize_anchor = old_panel->resize_anchor;
+        panel.resize_start = old_panel->resize_start;
         ReconcileUI(old_panel->content,std::move(panel.content),options);
         panel.content = std::move(old_panel->content);
     }

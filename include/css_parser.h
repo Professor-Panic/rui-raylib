@@ -38,6 +38,11 @@ std::optional<CSSLength> ParseCSSLength(
     std::string value
 );
 
+// font-size supports em without making em ambiguous for non-font lengths.
+std::optional<CSSLength> ParseCSSFontSizeLength(
+    std::string value
+);
+
 std::optional<float> ParseCSSOpacity(
     std::string value
 );
@@ -105,6 +110,10 @@ SelectorType ParseSelectorType(
 
 SelectorState ParseSelectorState(
     std::string value
+);
+
+std::vector<std::string> SplitCSSDescendantSelector(
+    const std::string& selector
 );
 
 StyleRule ParseRuleSelector(

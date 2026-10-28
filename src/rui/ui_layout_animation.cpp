@@ -45,6 +45,8 @@ const std::vector<PropertyType>& LayoutProperties() {
         PropertyType::Margin,PropertyType::MarginLeft,PropertyType::MarginRight,
         PropertyType::MarginTop,PropertyType::MarginBottom,
         PropertyType::FontSize,PropertyType::BorderWidth,
+        PropertyType::BorderTopWidth,PropertyType::BorderRightWidth,
+        PropertyType::BorderBottomWidth,PropertyType::BorderLeftWidth,
         PropertyType::Gap,PropertyType::RowGap,PropertyType::ColumnGap,
         PropertyType::Left,PropertyType::Right,PropertyType::Top,PropertyType::Bottom,
         PropertyType::FlexGrow,PropertyType::FlexShrink,PropertyType::FlexBasis,
@@ -60,6 +62,45 @@ bool IsLayoutProperty(PropertyType property) {
     return std::find(properties.begin(),properties.end(),property) != properties.end();
 }
 
+bool HasLayoutTransitionSpec(const ComputedStyle& style) {
+    for(const UITransitionSpec& transition : style.transitions) {
+        if(transition.duration <= 0.0f) continue;
+        if(transition.all) return true;
+        if(std::any_of(
+            transition.properties.begin(),transition.properties.end(),
+            IsLayoutProperty
+        )) return true;
+    }
+    return false;
+}
+
+bool AnimationTouchesLayout(
+    const StyleSheet& sheet,
+    const std::string& raw_name
+) {
+    const std::string name = NormalizeUIPseudoStateName(raw_name);
+    const auto definition = sheet.keyframes.find(name);
+    if(definition == sheet.keyframes.end()) return false;
+    for(const UIKeyframeStep& step : definition->second.steps) {
+        for(const Declaration& declaration : step.declarations) {
+            if(IsLayoutProperty(declaration.property)) return true;
+        }
+    }
+    return false;
+}
+
+std::vector<UIAnimationSpec> LayoutAnimationSpecs(
+    const StyleSheet& sheet,
+    const std::vector<UIAnimationSpec>& specs
+) {
+    std::vector<UIAnimationSpec> result;
+    result.reserve(specs.size());
+    for(const UIAnimationSpec& spec : specs) {
+        if(AnimationTouchesLayout(sheet,spec.name)) result.push_back(spec);
+    }
+    return result;
+}
+
 std::optional<PropertyValueType> ValueOf(const ComputedStyle& style,PropertyType property) {
     switch(property) {
         case PropertyType::Width: return style.width;
@@ -70,6 +111,10 @@ std::optional<PropertyValueType> ValueOf(const ComputedStyle& style,PropertyType
         case PropertyType::MaxHeight: return style.max_height;
         case PropertyType::FontSize: return style.font_size;
         case PropertyType::BorderWidth: return style.border_width;
+        case PropertyType::BorderTopWidth: return style.border_widths.top;
+        case PropertyType::BorderRightWidth: return style.border_widths.right;
+        case PropertyType::BorderBottomWidth: return style.border_widths.bottom;
+        case PropertyType::BorderLeftWidth: return style.border_widths.left;
         case PropertyType::Gap: return style.gap;
         case PropertyType::RowGap: return style.row_gap;
         case PropertyType::ColumnGap: return style.column_gap;
@@ -163,7 +208,26 @@ void Apply(ComputedStyle& style,PropertyType property,const PropertyValueType& v
         case PropertyType::MinHeight: style.min_height = *scalar; break;
         case PropertyType::MaxHeight: style.max_height = *scalar; break;
         case PropertyType::FontSize: style.font_size = *scalar; break;
-        case PropertyType::BorderWidth: style.border_width = *scalar; break;
+        case PropertyType::BorderWidth:
+            style.border_width = *scalar;
+            style.border_widths = EdgeValues(*scalar);
+            break;
+        case PropertyType::BorderTopWidth:
+            style.border_widths.top = *scalar;
+            style.border_width = MaximumBorderWidth(style);
+            break;
+        case PropertyType::BorderRightWidth:
+            style.border_widths.right = *scalar;
+            style.border_width = MaximumBorderWidth(style);
+            break;
+        case PropertyType::BorderBottomWidth:
+            style.border_widths.bottom = *scalar;
+            style.border_width = MaximumBorderWidth(style);
+            break;
+        case PropertyType::BorderLeftWidth:
+            style.border_widths.left = *scalar;
+            style.border_width = MaximumBorderWidth(style);
+            break;
         case PropertyType::Gap: style.gap = *scalar; break;
         case PropertyType::RowGap: style.row_gap = *scalar; break;
         case PropertyType::ColumnGap: style.column_gap = *scalar; break;
@@ -201,6 +265,18 @@ const UITransitionSpec* TransitionFor(const ComputedStyle& style,PropertyType pr
         if(transition.duration <= 0.0f) continue;
         if(transition.all) all = &transition;
         else if(std::find(transition.properties.begin(),transition.properties.end(),property) != transition.properties.end()) {
+            return &transition;
+        }
+        else if(
+            (property == PropertyType::BorderTopWidth ||
+             property == PropertyType::BorderRightWidth ||
+             property == PropertyType::BorderBottomWidth ||
+             property == PropertyType::BorderLeftWidth) &&
+            std::find(
+                transition.properties.begin(),transition.properties.end(),
+                PropertyType::BorderWidth
+            ) != transition.properties.end()
+        ) {
             return &transition;
         }
     }
@@ -314,11 +390,18 @@ UILayoutAnimationState& Ensure(UIElementBase& element) {
     return *element.layout_animation_state;
 }
 
-void SyncPlayers(UILayoutAnimationState& state,const std::vector<UIAnimationSpec>& specs,double now) {
-    if(SpecsEqual(state.automatic_specs,specs)) return;
-    state.automatic_specs = specs;
+void SyncPlayers(
+    UILayoutAnimationState& state,
+    const StyleSheet& sheet,
+    const std::vector<UIAnimationSpec>& specs,
+    double now
+) {
+    const std::vector<UIAnimationSpec> layout_specs =
+        LayoutAnimationSpecs(sheet,specs);
+    if(SpecsEqual(state.automatic_specs,layout_specs)) return;
+    state.automatic_specs = layout_specs;
     std::set<std::string> retained;
-    for(UIAnimationSpec spec : specs) {
+    for(UIAnimationSpec spec : layout_specs) {
         spec.name = NormalizeUIPseudoStateName(spec.name);
         if(spec.name.empty()) continue;
         retained.insert(spec.name);
@@ -343,11 +426,16 @@ UIAnimationSpec FindSpec(const UILayoutAnimationState& state,const std::string& 
     return fallback;
 }
 
-void ApplyCommands(UILayoutAnimationState& state,double now) {
+void ApplyCommands(
+    UILayoutAnimationState& state,
+    const StyleSheet& sheet,
+    double now
+) {
     for(const LayoutCommand& command : state.pending) {
         const std::string name = NormalizeUIPseudoStateName(command.name);
         auto found = state.players.find(name);
         if(command.command == UIAnimationCommand::Play || command.command == UIAnimationCommand::Restart) {
+            if(!AnimationTouchesLayout(sheet,name)) continue;
             if(found == state.players.end() || command.restart || command.command == UIAnimationCommand::Restart) {
                 UIAnimationSpec spec = FindSpec(state,name);
                 spec.paused = false;
@@ -511,21 +599,178 @@ bool RefreshContainerStates(UIContainer& container) {
     return changed;
 }
 
+void MergeFrameActivity(
+    UILayoutFrameActivity& destination,
+    const UILayoutFrameActivity& source
+) {
+    destination.pseudo_changed =
+        destination.pseudo_changed || source.pseudo_changed;
+    destination.animation_active =
+        destination.animation_active || source.animation_active;
+}
+
+void UpdateFrameElementState(
+    UIElementBase& element,
+    UILayoutFrameActivity& activity,
+    bool update_pseudo_states,
+    bool check_layout_animations
+) {
+    if(update_pseudo_states) {
+        element.pseudo_states.Update();
+        const std::size_t hash = element.pseudo_states.ActiveHash();
+        if(hash != element.last_layout_pseudo_hash) {
+            element.last_layout_pseudo_hash = hash;
+            activity.pseudo_changed = true;
+        }
+    }
+    if(check_layout_animations && !activity.animation_active) {
+        activity.animation_active = IsUILayoutAnimationActive(element);
+    }
+}
+
+UILayoutFrameActivity CollectFrameActivity(
+    UIContainer& container,
+    bool update_pseudo_states,
+    bool check_layout_animations
+) {
+    UILayoutFrameActivity activity;
+    UpdateFrameElementState(
+        container.rect,activity,update_pseudo_states,check_layout_animations
+    );
+
+    for(UIElement& element : container.elements) {
+        if(
+            !update_pseudo_states &&
+            check_layout_animations &&
+            activity.animation_active
+        ) {
+            break;
+        }
+
+        std::visit([&](auto& widget) {
+            using T = std::decay_t<decltype(widget)>;
+
+            if constexpr(IsUICustomElementPointerV<T>) {
+                if(!widget) return;
+                UpdateFrameElementState(
+                    widget->rect,activity,
+                    update_pseudo_states,check_layout_animations
+                );
+                if(auto* dock = dynamic_cast<UIDockSpace*>(widget.get())) {
+                    for(UIDockPanel& panel : dock->panels) {
+                        MergeFrameActivity(
+                            activity,
+                            CollectFrameActivity(
+                                panel.content,
+                                update_pseudo_states,
+                                check_layout_animations
+                            )
+                        );
+                        if(
+                            !update_pseudo_states &&
+                            check_layout_animations &&
+                            activity.animation_active
+                        ) break;
+                    }
+                }
+            }
+            else if constexpr(std::is_same_v<T,std::shared_ptr<UIContainer>>) {
+                if(widget) {
+                    MergeFrameActivity(
+                        activity,
+                        CollectFrameActivity(
+                            *widget,
+                            update_pseudo_states,
+                            check_layout_animations
+                        )
+                    );
+                }
+            }
+            else if constexpr(std::is_same_v<T,std::shared_ptr<UITabBar>>) {
+                if(!widget) return;
+                UpdateFrameElementState(
+                    widget->rect,activity,
+                    update_pseudo_states,check_layout_animations
+                );
+                for(UITab& tab : widget->tabs) {
+                    MergeFrameActivity(
+                        activity,
+                        CollectFrameActivity(
+                            tab.content,
+                            update_pseudo_states,
+                            check_layout_animations
+                        )
+                    );
+                    if(
+                        !update_pseudo_states &&
+                        check_layout_animations &&
+                        activity.animation_active
+                    ) break;
+                }
+            }
+            else if constexpr(IsUICompositePointerV<T>) {
+                if(!widget) return;
+                UpdateFrameElementState(
+                    widget->rect,activity,
+                    update_pseudo_states,check_layout_animations
+                );
+                MergeFrameActivity(
+                    activity,
+                    CollectFrameActivity(
+                        widget->content,
+                        update_pseudo_states,
+                        check_layout_animations
+                    )
+                );
+            }
+            else {
+                UpdateFrameElementState(
+                    widget.rect,activity,
+                    update_pseudo_states,check_layout_animations
+                );
+            }
+        },element);
+    }
+
+    return activity;
+}
+
 } // namespace
+
+bool IsUILayoutProperty(PropertyType property) {
+    return IsLayoutProperty(property);
+}
+
+bool UIAnimationTouchesLayout(
+    const StyleSheet& style_sheet,
+    const std::string& animation_name
+) {
+    return AnimationTouchesLayout(style_sheet,animation_name);
+}
 
 ComputedStyle ResolveLayoutAnimatedStyle(
     UIElementBase& element,
     const StyleSheet& style_sheet,
     ComputedStyle target_style
 ) {
+    // Keep static layout elements allocation-free. Previously every element
+    // acquired a layout-animation state during its first layout pass.
+    if(
+        !element.layout_animation_state &&
+        !HasLayoutTransitionSpec(target_style) &&
+        LayoutAnimationSpecs(style_sheet,target_style.animations).empty()
+    ) {
+        return target_style;
+    }
+
     UILayoutAnimationState& state = Ensure(element);
     const double now = GetTime();
     if(!state.initialized) {
         state.initialized = true;
         state.target = target_style;
         state.output = target_style;
-        SyncPlayers(state,target_style.animations,now);
-        ApplyCommands(state,now);
+        SyncPlayers(state,style_sheet,target_style.animations,now);
+        ApplyCommands(state,style_sheet,now);
     }
     else {
         ComputedStyle current = state.target;
@@ -562,8 +807,8 @@ ComputedStyle ResolveLayoutAnimatedStyle(
             );
         }
         state.target = target_style;
-        SyncPlayers(state,target_style.animations,now);
-        ApplyCommands(state,now);
+        SyncPlayers(state,style_sheet,target_style.animations,now);
+        ApplyCommands(state,style_sheet,now);
     }
 
     ComputedStyle output = target_style;
@@ -598,9 +843,27 @@ ComputedStyle ResolveLayoutAnimatedStyle(
 bool IsUILayoutAnimationActive(const UIElementBase& element) {
     if(!element.layout_animation_state) return false;
     const UILayoutAnimationState& state = *element.layout_animation_state;
-    if(!state.transitions.empty()) return true;
+    if(!state.pending.empty() || !state.transitions.empty()) return true;
+
+    const double now = GetTime();
     for(const auto& entry : state.players) {
-        if(!entry.second.stopped && (!entry.second.paused || entry.second.spec.infinite)) return true;
+        const LayoutPlayer& player = entry.second;
+        if(player.stopped || player.paused) continue;
+        if(player.spec.infinite) return true;
+
+        const double elapsed =
+            now-player.started-player.accumulated_pause-player.spec.delay;
+        if(elapsed < 0.0) return true;
+
+        const double duration = std::max(
+            0.001,
+            static_cast<double>(player.spec.duration)
+        );
+        const double iterations = std::max(
+            0.0,
+            static_cast<double>(player.spec.iterations)
+        );
+        if(elapsed < duration*iterations) return true;
     }
     return false;
 }
@@ -611,6 +874,17 @@ bool HasActiveUILayoutAnimations(const UIContainer& root) {
 
 bool RefreshUIPseudoStatesForLayout(UIContainer& root) {
     return RefreshContainerStates(root);
+}
+
+UILayoutFrameActivity RefreshUILayoutFrameActivity(
+    UIContainer& root,
+    bool update_pseudo_states,
+    bool check_layout_animations
+) {
+    if(!update_pseudo_states && !check_layout_animations) return {};
+    return CollectFrameActivity(
+        root,update_pseudo_states,check_layout_animations
+    );
 }
 
 void QueueUILayoutAnimationCommand(

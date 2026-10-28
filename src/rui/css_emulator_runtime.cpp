@@ -5,12 +5,13 @@ void ApplyRuntimeOverrides(
     UIRuntimeLayer& layer
 ) {
     VisitRuntimeElements(root,[&](UIRuntimeTarget& target) {
-        target.rect->runtime_offset = {0.0f,0.0f};
-        target.rect->runtime_size = {0.0f,0.0f};
-        target.rect->runtime_size_override = false;
-
         auto found = layer.overrides.find(target.key);
-        if(found == layer.overrides.end()) return;
+        if(found == layer.overrides.end()) {
+            // Keep transient runtime sizing produced by UISplitter. Reconciliation
+            // already carries it forward; clearing it here made every splitter
+            // snap back on the next frame.
+            return;
+        }
         target.rect->runtime_offset = found->second.offset;
         target.rect->runtime_size = found->second.size;
         target.rect->runtime_size_override = found->second.has_size;
@@ -78,7 +79,13 @@ void ResetRuntimeLayout(
     layer.active_key.clear();
     layer.interaction = UIRuntimeInteraction::None;
     layer.dirty = true;
-    ApplyRuntimeOverrides(root,layer);
+    VisitRuntimeElements(root,[&](UIRuntimeTarget& target) {
+        if(target.rect == nullptr) return;
+        target.rect->runtime_offset = {0.0f,0.0f};
+        target.rect->runtime_size = {0.0f,0.0f};
+        target.rect->runtime_size_override = false;
+    });
+    MarkLayoutDirty(root,true);
     if(layer.auto_save) SaveRuntimeLayout(layer);
 }
 
