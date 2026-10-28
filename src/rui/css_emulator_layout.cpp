@@ -542,11 +542,30 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                 ui.maximum_scroll.x
             );
 
+            // Follow-the-tail: if the view was at the bottom before this pass
+            // (or the content has never overflowed), stay at the bottom.
+            bool tail_moved = false;
+            if(ui.follow_tail) {
+                const bool was_at_bottom =
+                    ui.scroll.y >= ui.last_maximum_scroll_y - 1.0f;
+                if(was_at_bottom && ui.scroll.y != ui.maximum_scroll.y) {
+                    ui.scroll.y = ui.maximum_scroll.y;
+                    tail_moved = true;
+                }
+            }
+            ui.last_maximum_scroll_y = ui.maximum_scroll.y;
             ui.scroll.y = std::clamp(
                 ui.scroll.y,
                 0.0f,
                 ui.maximum_scroll.y
             );
+            if(tail_moved) {
+                // Children were positioned with the old scroll offset.
+                LayoutContainerPass(
+                    ui,style_sheet,containing_width,containing_height,true
+                );
+                return;
+            }
         }
         else {
             ui.scroll = {};

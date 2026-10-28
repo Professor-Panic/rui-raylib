@@ -2923,6 +2923,8 @@ struct UIContainer : UIStyleFluent<UIContainer> {
     bool dragging_vertical_scrollbar = false;
     float scrollbar_drag_anchor = 0.0f;
     float scrollbar_scroll_start = 0.0f;
+    bool follow_tail=false;
+    float last_maximum_scroll_y=0.0f;
     // Effective scale of the containing widget. Layout writes this before
     // recursing so a container scale applies to its complete subtree.
     float inherited_scale = 1.0f;

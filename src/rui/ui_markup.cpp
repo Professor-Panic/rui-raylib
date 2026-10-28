@@ -4154,6 +4154,7 @@ void UIXRuntime::Impl::RenderNode(
         container.style.display = DisplayType::Flex;
         container.disabled = AttributeBool(*this,node,"disabled",scope,container.disabled);
         container.show_scrollbars = AttributeBool(*this,node,"showScrollbars",scope,container.show_scrollbars);
+           container.follow_tail = AttributeBool(*this,node,"followTail",scope,container.follow_tail);
         const std::string key = GeneratedKey(*this,node,scope);
         ApplyCommon(*this,container,node,scope,key);
         RenderChildren(container,node.children,scope,slot_source,slot_scope,depth+1);
