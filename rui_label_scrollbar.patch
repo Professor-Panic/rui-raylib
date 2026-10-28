@@ -1,0 +1,49 @@
+--- a/src/rui/css_emulator_layout.cpp	2026-10-28 09:03:37.919917959 +0000
++++ b/src/rui/css_emulator_layout.cpp	2026-10-28 09:03:38.027198557 +0000
+@@ -743,6 +743,24 @@
+ 
+                     ApplyRuntimeSizeToElement(widget.rect,widget.style,inner);
+ 
++                    // A label with no explicit height keeps its measured text
++                    // height. Without this, ApplyRuntimeSizeToElement squashed
++                    // it to the parent's height (ShouldAutoHeight is only true
++                    // for an explicit `height: auto`), so tall text never made
++                    // its scroll container scrollable.
++                    if(
++                        !widget.style.height_length.has_value() &&
++                        !widget.rect.runtime_size_override
++                    ) {
++                        const float label_height = std::clamp(
++                            intrinsic_height,
++                            widget.style.min_height,
++                            widget.style.max_height
++                        );
++                        widget.rect.transform.height = label_height;
++                        widget.rect.layout_transform.height = label_height;
++                    }
++
+                     child = {
+                         &widget.rect,
+                         &widget.rect.transform,
+--- a/src/rui/css_emulator_tree.cpp	2026-10-28 09:03:37.920540413 +0000
++++ b/src/rui/css_emulator_tree.cpp	2026-10-28 09:03:38.029542675 +0000
+@@ -1456,10 +1456,17 @@
+         );
+     }
+     const float thickness = std::max(4.0f,ui.style.scrollbar_size);
+-    const Color bar_color = bar_style.background_color.a
++    // Only take colours from a ::scrollbar / ::scrollbar-thumb rule. Without
++    // one, bar_style is just the container's own style, so a light panel
++    // used to get a light bar that vanished against its own background.
++    const bool bar_part_styled =
++        StyleSheetUsesPart(style_sheet,CSS_UI_SCROLLBAR_PART);
++    const bool thumb_part_styled =
++        StyleSheetUsesPart(style_sheet,CSS_UI_SCROLLBAR_THUMB_PART);
++    const Color bar_color = (bar_part_styled && bar_style.background_color.a)
+         ? bar_style.background_color
+         : Color{20,22,28,180};
+-    const Color thumb_color = thumb_style.background_color.a
++    const Color thumb_color = (thumb_part_styled && thumb_style.background_color.a)
+         ? thumb_style.background_color
+         : Color{105,112,130,220};
+ 

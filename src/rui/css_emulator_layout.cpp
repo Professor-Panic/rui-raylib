@@ -1,4 +1,3 @@
-
 #include "css_emulator.h"
 
 bool RuntimeStyleFlag(
@@ -537,7 +536,6 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                         ui.rect.transform.height
                 )
             };
-
             ui.scroll.x = std::clamp(
                 ui.scroll.x,
                 0.0f,
@@ -742,6 +740,24 @@ void LayoutContainerPass(UIContainer& ui,const StyleSheet& style_sheet,float con
                             : widget.style.height;
 
                     ApplyRuntimeSizeToElement(widget.rect,widget.style,inner);
+
+                    // A label with no explicit height keeps its measured text
+                    // height. Without this, ApplyRuntimeSizeToElement squashed
+                    // it to the parent's height (ShouldAutoHeight is only true
+                    // for an explicit `height: auto`), so tall text never made
+                    // its scroll container scrollable.
+                    if(
+                        !widget.style.height_length.has_value() &&
+                        !widget.rect.runtime_size_override
+                    ) {
+                        const float label_height = std::clamp(
+                            intrinsic_height,
+                            widget.style.min_height,
+                            widget.style.max_height
+                        );
+                        widget.rect.transform.height = label_height;
+                        widget.rect.layout_transform.height = label_height;
+                    }
 
                     child = {
                         &widget.rect,

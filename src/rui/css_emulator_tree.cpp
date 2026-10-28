@@ -1409,7 +1409,7 @@ void DrawTabBar(
         const Rectangle item = TabItemRectangle(tabs,index);
         DrawStyledTextBox(item,tab.title,style,TextAlign::Center);
         if(tab.closable || tabs.style.tab_closable.value_or(false)) {
-            DrawUIText(
+            DrawTextEx(
                 ResolveUIFont(style.font),"x",
                 {item.x+item.width-item.height*0.55f,item.y+(item.height-style.font_size)*0.5f},
                 style.font_size,1.0f,style.text_color
@@ -1456,10 +1456,17 @@ void DrawContainerScrollbars(
         );
     }
     const float thickness = std::max(4.0f,ui.style.scrollbar_size);
-    const Color bar_color = bar_style.background_color.a
+    // Only take colours from a ::scrollbar / ::scrollbar-thumb rule. Without
+    // one, bar_style is just the container's own style, so a light panel
+    // used to get a light bar that vanished against its own background.
+    const bool bar_part_styled =
+        StyleSheetUsesPart(style_sheet,CSS_UI_SCROLLBAR_PART);
+    const bool thumb_part_styled =
+        StyleSheetUsesPart(style_sheet,CSS_UI_SCROLLBAR_THUMB_PART);
+    const Color bar_color = (bar_part_styled && bar_style.background_color.a)
         ? bar_style.background_color
         : Color{20,22,28,180};
-    const Color thumb_color = thumb_style.background_color.a
+    const Color thumb_color = (thumb_part_styled && thumb_style.background_color.a)
         ? thumb_style.background_color
         : Color{105,112,130,220};
 
