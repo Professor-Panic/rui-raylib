@@ -653,11 +653,11 @@ void UpdateInput(UIInput<Color>& input) {
                 character = GetCharPressed();
             }
 
-            if(IsKeyPressed(KEY_BACKSPACE)) {
+            if(UIKeyPressedOrRepeat(KEY_BACKSPACE)) {
                 UIInputBackspaceText(input,buffer);
             }
 
-            if(IsKeyPressed(KEY_DELETE)) {
+            if(UIKeyPressedOrRepeat(KEY_DELETE)) {
                 UIInputDeleteText(input,buffer);
             }
 
@@ -1106,7 +1106,7 @@ void UpdateInput(UIInput<std::string>& input) {
         character = GetCharPressed();
     }
 
-    if(IsKeyPressed(KEY_BACKSPACE)) {
+    if(UIKeyPressedOrRepeat(KEY_BACKSPACE)) {
         const std::string before = input.edit_buffer;
         UIInputBackspaceText(input,input.edit_buffer);
         if(input.edit_buffer != before) {
@@ -1115,7 +1115,7 @@ void UpdateInput(UIInput<std::string>& input) {
         }
     }
 
-    if(IsKeyPressed(KEY_DELETE)) {
+    if(UIKeyPressedOrRepeat(KEY_DELETE)) {
         const std::string before = input.edit_buffer;
         UIInputDeleteText(input,input.edit_buffer);
         if(input.edit_buffer != before) {

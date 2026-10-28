@@ -887,11 +887,11 @@ void UITextBox::Update(bool inherited_disabled) {
 
     if(IsKeyPressed(KEY_HOME)) moveCaret(0);
     else if(IsKeyPressed(KEY_END)) moveCaret(text.size());
-    else if(IsKeyPressed(KEY_LEFT)) {
+    else if(UIKeyPressedOrRepeat(KEY_LEFT)) {
         if(!shift && selection_end > selection_start) moveCaret(selection_start);
         else moveCaret(caret > 0 ? caret-1 : 0);
     }
-    else if(IsKeyPressed(KEY_RIGHT)) {
+    else if(UIKeyPressedOrRepeat(KEY_RIGHT)) {
         if(!shift && selection_end > selection_start) moveCaret(selection_end);
         else moveCaret(std::min(text.size(),caret+1));
     }
@@ -909,7 +909,7 @@ void UITextBox::Update(bool inherited_disabled) {
         character = GetCharPressed();
     }
 
-    if(IsKeyPressed(KEY_BACKSPACE)) {
+    if(UIKeyPressedOrRepeat(KEY_BACKSPACE)) {
         if(DeleteTextBoxSelection(*this)) changed = true;
         else if(caret > 0) {
             text.erase(caret-1,1);
@@ -917,7 +917,7 @@ void UITextBox::Update(bool inherited_disabled) {
             changed = true;
         }
     }
-    if(IsKeyPressed(KEY_DELETE)) {
+    if(UIKeyPressedOrRepeat(KEY_DELETE)) {
         if(DeleteTextBoxSelection(*this)) changed = true;
         else if(caret < text.size()) {
             text.erase(caret,1);

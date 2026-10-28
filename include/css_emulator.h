@@ -360,6 +360,11 @@ std::optional<UIEvaluatedStyleValue> EvaluateUIStyleExpression(
     std::string* error = nullptr
 );
 
+// Held keys auto-repeat (caret movement, backspace, delete, stepping) like OS text fields.
+inline bool UIKeyPressedOrRepeat(int key) {
+    return IsKeyPressed(key) || IsKeyPressedRepeat(key);
+}
+
 enum class LengthUnit {
     Auto,
     Pixels,
@@ -5454,11 +5459,11 @@ inline void UIInputHandleTextNavigation(UIInput<T>& input, std::string& buffer) 
 
     if(IsKeyPressed(KEY_HOME)) move_caret(0);
     else if(IsKeyPressed(KEY_END)) move_caret(buffer.size());
-    else if(IsKeyPressed(KEY_LEFT)) {
+    else if(UIKeyPressedOrRepeat(KEY_LEFT)) {
         if(!shift && UIInputHasTextSelection(input)) move_caret(input.text_selection_start);
         else move_caret(input.text_caret > 0 ? input.text_caret-1 : 0);
     }
-    else if(IsKeyPressed(KEY_RIGHT)) {
+    else if(UIKeyPressedOrRepeat(KEY_RIGHT)) {
         if(!shift && UIInputHasTextSelection(input)) move_caret(input.text_selection_end);
         else move_caret(std::min(buffer.size(),input.text_caret+1));
     }
@@ -6079,14 +6084,14 @@ inline void UpdateVectorInput(UIInput<T>& input) {
         int direction = 0;
 
         if(
-            IsKeyPressed(KEY_LEFT) ||
-            IsKeyPressed(KEY_DOWN)
+            UIKeyPressedOrRepeat(KEY_LEFT) ||
+            UIKeyPressedOrRepeat(KEY_DOWN)
         ) {
             direction = -1;
         }
         else if(
-            IsKeyPressed(KEY_RIGHT) ||
-            IsKeyPressed(KEY_UP)
+            UIKeyPressedOrRepeat(KEY_RIGHT) ||
+            UIKeyPressedOrRepeat(KEY_UP)
         ) {
             direction = 1;
         }
@@ -6238,11 +6243,11 @@ inline void UpdateVectorInput(UIInput<T>& input) {
             character = GetCharPressed();
         }
 
-        if(IsKeyPressed(KEY_BACKSPACE)) {
+        if(UIKeyPressedOrRepeat(KEY_BACKSPACE)) {
             UIInputBackspaceText(input,buffer);
         }
 
-        if(IsKeyPressed(KEY_DELETE)) {
+        if(UIKeyPressedOrRepeat(KEY_DELETE)) {
             UIInputDeleteText(input,buffer);
         }
 
@@ -6622,11 +6627,11 @@ inline void UpdateInput(UIInput<T>& input) {
             input.input_type == InputType::Drag
         )
     ) {
-        if(IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_DOWN)) {
+        if(UIKeyPressedOrRepeat(KEY_LEFT) || UIKeyPressedOrRepeat(KEY_DOWN)) {
             StepInputValue(input,-1);
         }
 
-        if(IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_UP)) {
+        if(UIKeyPressedOrRepeat(KEY_RIGHT) || UIKeyPressedOrRepeat(KEY_UP)) {
             StepInputValue(input,1);
         }
     }
@@ -6705,11 +6710,11 @@ inline void UpdateInput(UIInput<T>& input) {
             character = GetCharPressed();
         }
 
-        if(IsKeyPressed(KEY_BACKSPACE)) {
+        if(UIKeyPressedOrRepeat(KEY_BACKSPACE)) {
             UIInputBackspaceText(input,input.edit_buffer);
         }
 
-        if(IsKeyPressed(KEY_DELETE)) {
+        if(UIKeyPressedOrRepeat(KEY_DELETE)) {
             UIInputDeleteText(input,input.edit_buffer);
         }
 
@@ -8581,7 +8586,6 @@ std::optional<UIRuntimeTarget> FindRuntimeTarget(
     UIContainer& root,
     const std::string& key
 );
-
 Rectangle RuntimeParentBounds(const UIRuntimeTarget& target);
 
 bool RuntimeCanMove(const UIRuntimeTarget& target);
