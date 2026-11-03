@@ -26,7 +26,9 @@ void ApplyRuntimeSizeToElement(
 
     if(RuntimeStyleFlag(style.runtime_constrain,true)) {
         rect.transform.width = std::min(rect.transform.width,parent_bounds.width);
-        if(ConstrainHeightToParent(style)) {
+        // Height is only clamped for a user-resized element; a fixed-height child of a
+        // scrolling container must keep its size when its content overflows.
+        if(rect.runtime_size_override && ConstrainHeightToParent(style)) {
             rect.transform.height = std::min(rect.transform.height,parent_bounds.height);
         }
     }
@@ -45,9 +47,14 @@ void ApplyRuntimePositionToElement(
     if(RuntimeStyleFlag(style.runtime_constrain,true)) {
         const float maximum_x = std::max(parent_bounds.x,parent_bounds.x+parent_bounds.width-rect.transform.width);
         const float maximum_y = std::max(parent_bounds.y,parent_bounds.y+parent_bounds.height-rect.transform.height);
-        rect.transform.x = std::clamp(rect.transform.x,parent_bounds.x,maximum_x);
-        if(ConstrainHeightToParent(style)) {
-            rect.transform.y = std::clamp(rect.transform.y,parent_bounds.y,maximum_y);
+        // Only keep *dragged* elements inside the parent. Normally laid-out children
+        // (e.g. the last item of a scrolling list) may sit outside the visible area.
+        const bool dragged = rect.runtime_offset.x != 0.0f || rect.runtime_offset.y != 0.0f;
+        if(dragged) {
+            rect.transform.x = std::clamp(rect.transform.x,parent_bounds.x,maximum_x);
+            if(ConstrainHeightToParent(style)) {
+                rect.transform.y = std::clamp(rect.transform.y,parent_bounds.y,maximum_y);
+            }
         }
     }
 }

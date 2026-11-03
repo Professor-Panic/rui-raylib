@@ -1877,11 +1877,17 @@ void DrawElementsClippedInternal(
                             )
                         )
                     ) {
-                        SetUIDrawScissor(
-                            context,
-                            child_clip_active,
-                            child_clip
-                        );
+                        Rectangle clip = child_clip;
+                        bool clipActive = child_clip_active;
+
+                        if constexpr (std::is_same_v<T, UIInput<std::string>>)
+                        {
+                            clip = clipActive ? GetCollisionRec(child_clip, widget.rect.transform)
+                                            : widget.rect.transform;
+                            clipActive = true;
+                        }
+
+                        SetUIDrawScissor(context, clipActive, clip);
 
                         bool composited=false;
                         if(StyleMayUseCompositing(style_sheet,SelectorType::Input,widget.style)) {

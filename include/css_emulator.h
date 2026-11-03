@@ -7469,6 +7469,7 @@ inline Vector2 DrawScalarInputLabelValue(
     );
     const float group_width =
         label_width+label_gap+value_size.x;
+    
     const float group_x = GetTextX(
         content_rect,
         group_width,
@@ -7661,6 +7662,14 @@ inline void DrawInputComponentText(
             : label_style.margin.left
     );
     const float group_width = label_width + label_gap + value_size.x;
+    // Label + value don't fit in this cell: drop the label and show just the value.
+    if(group_width > component_rect.width) {
+        draw_value({
+            std::round(component_rect.x + (component_rect.width-value_size.x)*0.5f),
+            std::round(component_rect.y + (component_rect.height-value_size.y)*0.5f)
+        });
+        return;
+    }
     const float group_x =
         component_rect.x +
         std::max(0.0f,(component_rect.width-group_width)*0.5f);

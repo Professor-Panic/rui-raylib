@@ -202,6 +202,8 @@ void ReconcileUI(
 ) {
     PreserveUIElementBase(rebuilt.rect,destination.rect,options);
     rebuilt.scroll = destination.scroll;
+    rebuilt.maximum_scroll = destination.maximum_scroll;                // new
+    rebuilt.last_maximum_scroll_y = destination.last_maximum_scroll_y;  // new
     rebuilt.dragging_horizontal_scrollbar =
         destination.dragging_horizontal_scrollbar;
     rebuilt.dragging_vertical_scrollbar =
